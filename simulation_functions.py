@@ -1,5 +1,7 @@
 import numpy as np
 import pandas as pd
+from pydeseq2.dds import DeseqDataSet
+from pydeseq2.utils import inverse_normal_transform
 
 def sim_mut(mutation_probabilities, n_samples):
     """
@@ -58,10 +60,79 @@ def sim_cna(cna_lambdas, n_samples):
             lam=cna_lambdas[i],
             size=n_samples
         )
-
     return sim_cna
 
-def estimate_deseq2_parameters(rna_df, size_factor_sd=0.2, seed=None):
+
+def sim_by_cluster(mut, cna, subtype, n_samples):
+    """
+    Simulate mutational and copy number data by subtype cluster.
+
+    Parameters
+    ----------
+    mut : pd.DataFrame
+        Binary mutation matrix (samples × genes).
+    cna : pd.DataFrame
+        Log2 CNA matrix (samples × genes).
+    subtype : pd.DataFrame
+        DataFrame with a 'Subtype' column indexed by sample.
+    n_samples : int
+        Total number of samples to simulate.
+
+    Returns
+    -------
+    synthetic_mut : pd.DataFrame
+        Simulated mutation matrix.
+    synthetic_cna : pd.DataFrame
+        Simulated CNA matrix.
+    """
+    M = pd.concat([mut, subtype], axis=1)
+    C = pd.concat([cna, subtype], axis=1)
+    subtype_counts = subtype['Subtype'].value_counts()
+    subtypes = subtype_counts.index.tolist()
+
+    proportions = subtype_counts / subtype_counts.sum()
+
+    # Step 2: Get rounded sample sizes
+    rounded_sizes = (proportions * n_samples).round().astype(int)
+
+    # Step 3: Adjust the last subtype to make total exactly 600
+    difference = n_samples - rounded_sizes.sum()
+    rounded_sizes.iloc[-1] += difference  # may be negative or positive
+
+
+    new_mut = []
+    new_cna = []
+
+    for s, n in zip(subtypes, rounded_sizes):
+        # Subtype-specific samples
+        M_s = M[M['Subtype'] == s].drop(columns='Subtype')
+        C_s = C[C['Subtype'] == s].drop(columns='Subtype')
+
+        # Estimate mutation probabilities
+        mut_probs = M_s.mean(axis=0)
+
+        # Shift CNA to be non-negative for Poisson
+        cna_shifted = C_s + 2
+        cna_discrete = np.round(cna_shifted).astype(int)
+        lambdas = cna_discrete.mean(axis=0)
+
+        # Simulate mutations and CNAs
+        mut_cluster = sim_mut(mut_probs, n_samples=n)
+        cna_cluster = sim_cna(lambdas, n_samples=n)
+
+        new_mut.append(mut_cluster)
+        new_cna.append(cna_cluster)
+
+    # Recombine cluster-wise results
+    sample_names = [f"Sample_{i+1}" for i in range(n_samples)]
+
+    synthetic_mut = pd.DataFrame(np.vstack(new_mut), columns=mut.columns, index=sample_names)
+    synthetic_cna = pd.DataFrame(np.vstack(new_cna), columns=cna.columns, index=sample_names)
+
+    return synthetic_mut, synthetic_cna
+
+
+def estimate_deseq2_parameters(rna_df, size_factor_sd=0.2, seed=None, condition=None):
     """
     Estimate DESeq2-style parameters from real RNA-seq data.
 
@@ -94,22 +165,25 @@ def estimate_deseq2_parameters(rna_df, size_factor_sd=0.2, seed=None):
     gene_means = rna_df.mean()
     gene_vars = rna_df.var()
 
-    # Estimate dispersions: α = (var - mean) / mean^2
-    D = (gene_vars - gene_means) / (gene_means ** 2)
-    D = D.clip(lower=1e-6)  # avoid zero or negative values
+    # Create dummy condition column (PyDESeq2 requires at least one design variable)
+    metadata = pd.DataFrame({'condition': [condition] * rna_df.shape[0]}, index=rna_df.index)
 
-    # Simulate sample-specific size factors from log-normal distribution
-    n_samples = rna_df.shape[0]
-    s = np.random.lognormal(mean=0, sigma=size_factor_sd, size=n_samples)
+    # Set up DESeq2 dataset (no actual design comparison here)
+    dds = DeseqDataSet(
+        counts=rna_df,
+        clinical=metadata,
+        design_factors="condition",
+        ref_level=condition
+    )
 
-    # Build q_ij: replicate gene means across all samples
-    q_matrix = np.tile(gene_means.values, (n_samples, 1))  # shape: (samples, genes)
+    # Run normalization and dispersion estimation
+    dds.deseq2()
 
-    # Apply size factors to get μ_ij = s_j · q_ij
-    mu_matrix = q_matrix * s[:, np.newaxis]
-    mu_matrix = pd.DataFrame(mu_matrix, index=rna_df.index, columns=rna_df.columns)
-
-    return gene_means, gene_vars, D, s, mu_matrix
+    # Extract results
+    D = dds.dispersions_.copy()
+    s= dds.size_factors_.copy()
+    normalised_counts = dds.norm_counts_.copy()
+    return gene_means, gene_vars, D, s, normalised_counts
 
 def sim_mod_exp(x_mut, B, C, D, s, a):
     """
