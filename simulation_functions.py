@@ -57,28 +57,22 @@ def sim_cna(means, variances, n_samples):
         Simulated CNA values.
     """
     n_genes = len(means)
-    sim_cna = np.zeros((n_samples, n_genes))
+    cna_test = np.zeros((n_samples, n_genes))
 
     for i in range(n_genes):
-        mu = means.iloc[i] if isinstance(means, pd.Series) else means[i]
-        var = variances.iloc[i] if isinstance(variances, pd.Series) else variances[i]
+        mu = means.iloc[i]
+        var = variances.iloc[i]
 
-        # Ensure valid variance
-        if var <= mu or not np.isfinite(var):
-            var = mu + max(1e-3, mu * 0.05)
+    if var <= mu or not np.isfinite(var):
+        var = mu + max(1e-2, mu * 0.05)
 
         r = mu**2 / (var - mu)
-        r = max(r, 1e-3)  # must be > 0
         p = r / (r + mu)
-        p = min(max(p, 1e-6), 1 - 1e-6)  # keep p in (0, 1)
 
-        try:
-            sim_cna[:, i] = nbinom.rvs(n=r, p=p, size=n_samples)
-        except ValueError as e:
-            print(f"[sim_cna] Skipping gene {i}: Invalid NB params r={r}, p={p} (mu={mu}, var={var})")
-            sim_cna[:, i] = 0
+        # Sample from Negative Binomial
+        cna_test[:, i] = nbinom.rvs(n=r, p=p, size=n_samples)
 
-    return sim_cna
+        return cna_test
 
 
 def sim_by_cluster(mut, cna, subtype, n_samples):
@@ -127,11 +121,15 @@ def sim_by_cluster(mut, cna, subtype, n_samples):
         C_s = C[C['Subtype'] == s].drop(columns='Subtype')
 
         # Estimate mutation probabilities
-        mut_probs = M_s.mean(axis=0)
+        mut_probs = M_s.mean(axis=0).fillna(0).clip(0, 1)
 
         # Shift CNA to be non-negative for Poisson
         means = C_s.mean()
         var = C_s.var()
+        # # Drop genes with NaNs
+        # valid_genes = means.index[~(means.isna() | var.isna())]
+        # means = means[valid_genes]
+        # var = var[valid_genes]
 
         # Simulate mutations and CNAs
         mut_cluster = sim_mut(mut_probs, n_samples=n)
