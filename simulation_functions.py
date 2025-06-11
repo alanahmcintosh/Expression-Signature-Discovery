@@ -1,7 +1,10 @@
 import numpy as np
 import pandas as pd
 from pydeseq2.dds import DeseqDataSet
-from pydeseq2.utils import inverse_normal_transform
+from scipy.stats import nbinom
+from pydeseq2.default_inference import DefaultInference
+import random 
+import numpy.random as npr
 
 def sim_mut(mutation_probabilities, n_samples):
     """
@@ -27,39 +30,54 @@ def sim_mut(mutation_probabilities, n_samples):
     for i in range(len(mutation_probabilities)):
         sim_mutations[:, i] = np.random.binomial(
             n=1,
-            p=mutation_probabilities[i],
+            p = mutation_probabilities.iloc[i] if isinstance(mutation_probabilities, pd.Series) else mutation_probabilities[i],
             size=n_samples
         )
 
     return sim_mutations
 
 
-def sim_cna(cna_lambdas, n_samples):
-    """
-    Simulate CNA-like values from Poisson distributions.
 
-    Parameters:
-    -----------
-    cna_lambdas : list or np.ndarray
-        Length-G array where each value is the expected CNA count (lambda) for one gene.
-        These represent average CNA signal magnitude across samples.
+def sim_cna(means, variances, n_samples):
+    """
+    Simulate CNA values using a Negative Binomial distribution.
+
+    Parameters
+    ----------
+    means : array-like or pd.Series, shape (n_genes,)
+        Mean CNA values per gene.
+    variances : array-like or pd.Series, shape (n_genes,)
+        Variance of CNA values per gene.
     n_samples : int
-        Number of synthetic samples to generate.
+        Number of samples to simulate.
 
-    Returns:
-    --------
-    sim_cna : np.ndarray
-        Matrix of simulated CNA values (n_samples × G),
-        where values are integers >= 0 (e.g., copy number intensity).
+    Returns
+    -------
+    sim_cna : np.ndarray, shape (n_samples, n_genes)
+        Simulated CNA values.
     """
-    sim_cna = np.zeros((n_samples, len(cna_lambdas)), dtype=int)
+    n_genes = len(means)
+    sim_cna = np.zeros((n_samples, n_genes))
 
-    # For each gene, simulate CNA values using a Poisson distribution
-    for i in range(len(cna_lambdas)):
-        sim_cna[:, i] = np.random.poisson(
-            lam=cna_lambdas[i],
-            size=n_samples
-        )
+    for i in range(n_genes):
+        mu = means.iloc[i] if isinstance(means, pd.Series) else means[i]
+        var = variances.iloc[i] if isinstance(variances, pd.Series) else variances[i]
+
+        # Ensure valid variance
+        if var <= mu or not np.isfinite(var):
+            var = mu + max(1e-3, mu * 0.05)
+
+        r = mu**2 / (var - mu)
+        r = max(r, 1e-3)  # must be > 0
+        p = r / (r + mu)
+        p = min(max(p, 1e-6), 1 - 1e-6)  # keep p in (0, 1)
+
+        try:
+            sim_cna[:, i] = nbinom.rvs(n=r, p=p, size=n_samples)
+        except ValueError as e:
+            print(f"[sim_cna] Skipping gene {i}: Invalid NB params r={r}, p={p} (mu={mu}, var={var})")
+            sim_cna[:, i] = 0
+
     return sim_cna
 
 
@@ -112,13 +130,12 @@ def sim_by_cluster(mut, cna, subtype, n_samples):
         mut_probs = M_s.mean(axis=0)
 
         # Shift CNA to be non-negative for Poisson
-        cna_shifted = C_s + 2
-        cna_discrete = np.round(cna_shifted).astype(int)
-        lambdas = cna_discrete.mean(axis=0)
+        means = C_s.mean()
+        var = C_s.var()
 
         # Simulate mutations and CNAs
         mut_cluster = sim_mut(mut_probs, n_samples=n)
-        cna_cluster = sim_cna(lambdas, n_samples=n)
+        cna_cluster = sim_cna(means, var, n_samples=n)
 
         new_mut.append(mut_cluster)
         new_cna.append(cna_cluster)
@@ -131,117 +148,152 @@ def sim_by_cluster(mut, cna, subtype, n_samples):
 
     return synthetic_mut, synthetic_cna
 
+"""
+EXPRESSION  SIMULATION FUNCTIONS
+"""
 
-def estimate_deseq2_parameters(rna_df, size_factor_sd=0.2, seed=None, condition=None):
+"""
+EXPRESSION SIMULATION FUNCTIONS
+"""
+
+import numpy as np
+import pandas as pd
+import random
+from scipy.stats import nbinom
+from pydeseq2.dds import DeseqDataSet
+
+
+def estimate_deseq2_parameters(rna_df, size_factor_sd=0.2, seed=None, condition='A'):
     """
     Estimate DESeq2-style parameters from real RNA-seq data.
-
-    Parameters:
-    -----------
-    rna_df : pd.DataFrame
-        RNA-seq count matrix (samples × genes), untransformed.
-    size_factor_sd : float
-        Standard deviation for log-normal sample size factors (library sizes).
-    seed : int or None
-        Random seed for reproducibility.
-
-    Returns:
-    --------
-    gene_means : pd.Series
-        Mean expression for each gene.
-    gene_vars : pd.Series
-        Variance of expression for each gene.
-    D : pd.Series
-        DESeq2-style dispersion estimates for each gene.
-    s : np.ndarray
-        Per-sample library size scaling factors.
-    mu_matrix : pd.DataFrame
-        Expected counts (samples × genes) for input to NB simulation.
+    Returns gene means, variances, dispersions, and size factors.
     """
     if seed is not None:
         np.random.seed(seed)
 
-    # Mean and variance per gene
-    gene_means = rna_df.mean()
-    gene_vars = rna_df.var()
-
-    # Create dummy condition column (PyDESeq2 requires at least one design variable)
+    rna_df = rna_df.round().astype(int)
     metadata = pd.DataFrame({'condition': [condition] * rna_df.shape[0]}, index=rna_df.index)
 
-    # Set up DESeq2 dataset (no actual design comparison here)
     dds = DeseqDataSet(
         counts=rna_df,
-        clinical=metadata,
+        metadata=metadata,
         design_factors="condition",
         ref_level=condition
     )
-
-    # Run normalization and dispersion estimation
     dds.deseq2()
 
-    # Extract results
-    D = dds.dispersions_.copy()
-    s= dds.size_factors_.copy()
-    normalised_counts = dds.norm_counts_.copy()
-    return gene_means, gene_vars, D, s, normalised_counts
+    gene_means = rna_df.mean()
+    gene_vars = rna_df.var()
+    dispersions = pd.Series(dds.varm["dispersions"], index=rna_df.columns)
+    size_factors = dds.obsm['size_factors']
 
-def sim_mod_exp(x_mut, B, C, D, s, a):
+    return gene_means, gene_vars, dispersions, size_factors
+
+
+def simulate_rna_background(gene_means, dispersions, size_factors, n_samples):
     """
-    Simulate gene expression means (mu_ij) from:
-        μ_ij = s_j * (x_j·B + a_i) * c_ij where
-            s_j = sequencing depth for sample j, 
-            a_i = basal expression for gene i, 
-            x_j = binary matrix for sample j, 1 = alteration present,
-            c_ij = copy number for gene i in sample j
-
-
-    Parameters:
-    -----------
-    x_mut : np.ndarray
-        Binary matrix (samples × alterations), 1 = alteration present.
-    B : np.ndarray
-        Effect matrix (alterations × genes), beta_ki = effect of alteration k on gene i.
-    C : np.ndarray
-        Copy number matrix (samples × genes), c_ij = copy number factor for gene i in sample j.
-    D : np.ndarray
-        Dispersion vector (genes,) — not used in mu calculation, for NB sampling later.
-    s : np.ndarray
-        Size factor vector (samples,) — models sequencing depth.
-    a : np.ndarray
-        Basal expression vector (genes,) — baseline expression for each gene.
-
-    Returns:
-    --------
-    mu : np.ndarray
-        Matrix of expected expression values (samples × genes)
+    Simulate RNA expression background using NB with DESeq2-style parameters.
     """
+    mu_matrix = np.outer(size_factors, gene_means)
+    return pd.DataFrame(mu_matrix, columns=gene_means.index)
 
-    #  mu = s*(np.matmul(x_mut, B) + D)*(C)
 
-    # Linear component from mutations: (samples × alterations) · (alterations × genes) = (samples × genes)
-    xB = np.matmul(x_mut, B)  # shape: (n_samples, n_genes)
+def generate_signatures(genes, alteration_features, min_size=1, max_size=150):
+    """
+    Create random expression signatures for each alteration.
+    Ensures each altered gene is a target of its own signature.
+    """
+    signatures = {}
+    for alt in alteration_features:
+        base_gene = alt.split('_')[0]
+        if base_gene not in genes:
+            continue
+        n_targets = random.randint(min_size, max_size)
+        potential_targets = [g for g in genes if g != base_gene]
+        if len(potential_targets) < n_targets - 1:
+            continue
+        targets = [base_gene] + random.sample(potential_targets, k=n_targets - 1)
+        effects = {t: np.round(np.random.uniform(-2.5, 2.5), 2) for t in targets}
+        signatures[alt] = {'targets': targets, 'effects': effects}
+    return signatures
 
-    # Add basal expression (broadcasting over rows)
-    base_expr = xB + a  # shape: (n_samples, n_genes)
 
-    # Multiply by copy number modulation (elementwise)
-    expr_cna = base_expr * C  # shape: (n_samples, n_genes)
+def inject_expression_effects(expr_df, alteration_df, signatures, cna_df=None):
+    """
+    Inject additive alteration effects into expression matrix.
+    Optionally includes CNA multiplicative modulation.
+    """
+    modified = expr_df.copy()
+    for sample in expr_df.index:
+        active_alts = alteration_df.columns[alteration_df.loc[sample] == 1]
+        for gene in expr_df.columns:
+            alpha_i = expr_df.loc[sample, gene]  # baseline
+            beta_sum = 0
+            for alt in active_alts:
+                if alt in signatures and gene in signatures[alt]['targets']:
+                    beta_sum += signatures[alt]['effects'][gene]
+            copy_factor = cna_df.loc[sample, gene] if (cna_df is not None and gene in cna_df.columns) else 1.0
+            expr_value = (beta_sum + alpha_i) * copy_factor
+            modified.loc[sample, gene] = max(0, expr_value)
+    return modified
 
-    # Multiply by size factors per sample (broadcasting over columns)
-    mu = expr_cna * s[:, np.newaxis]  # shape: (n_samples, n_genes)
-
-    return mu
 
 def sample_nb(mu, dispersions):
     """
-    Sample from NB(mu, dispersion) for each gene/sample.
+    Sample from Negative Binomial for each gene/sample using DESeq2-style dispersion.
     """
-    r = 1 / dispersions  # shape: (genes,)
+    r = 1 / dispersions.values
     r = np.clip(r, 1e-6, 1e6)
-
-    # p_ij = r / (r + mu_ij) → broadcasting
     p = r / (r + mu)
-    
-    # Negative Binomial sampling
     counts = np.random.negative_binomial(n=r, p=p)
     return counts
+
+
+def simulate_rna_with_signatures(
+    rna_df,
+    alteration_df,
+    cna_df,
+    n_samples=600,
+    min_sig_size=1,
+    max_sig_size=150,
+    n_genes_to_sim=10000,
+    seed=None
+):
+    """
+    Main simulation function: combines background expression, mutation/CNA effects, and sampling.
+    """
+    if seed is not None:
+        np.random.seed(seed)
+
+    gene_means, gene_vars, dispersions, size_factors = estimate_deseq2_parameters(rna_df, seed=seed)
+   
+    altered_genes = set([a.split('_')[0] for a in alteration_df.columns])
+    top_genes = gene_means.sort_values(ascending=False).head(n_genes_to_sim).index
+    genes_to_sim = sorted(set(top_genes).union(altered_genes).intersection(rna_df.columns))
+
+    rna_df = rna_df[genes_to_sim]
+    gene_means = gene_means[genes_to_sim]
+    gene_vars = gene_vars[genes_to_sim]
+    dispersions = dispersions[genes_to_sim]
+
+    if all(col.endswith('_CNA') for col in cna_df.columns):
+        cna_df.columns = cna_df.columns.str.replace('_CNA', '', regex=False)
+    cna_df = cna_df.loc[:, cna_df.columns.isin(genes_to_sim)]
+
+    expr_bg = simulate_rna_background(gene_means, dispersions, size_factors[:n_samples], n_samples)
+    expr_bg.index = [f"Sample_{i+1}" for i in range(n_samples)]
+    alteration_df = alteration_df.copy()
+    alteration_df.index = expr_bg.index
+    if cna_df is not None:
+        cna_df = cna_df.copy()
+        cna_df.index = expr_bg.index
+
+
+    all_alts = alteration_df.columns.tolist()
+    true_signatures = generate_signatures(expr_bg.columns.tolist(), all_alts, min_sig_size, max_sig_size)
+
+    expr_effected = inject_expression_effects(expr_bg, alteration_df, true_signatures, cna_df)
+    expr_counts = sample_nb(expr_effected.values, dispersions)
+
+    expr_sim = pd.DataFrame(expr_counts, columns=expr_bg.columns, index=expr_bg.index)
+    return expr_sim, true_signatures
