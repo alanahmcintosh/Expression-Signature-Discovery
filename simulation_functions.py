@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 from pydeseq2.dds import DeseqDataSet
-from scipy.stats import nbinom
+from scipy.stats import nbinom, binom
 from pydeseq2.default_inference import DefaultInference
 import random 
 import numpy.random as npr
@@ -38,15 +38,17 @@ def sim_mut(mutation_probabilities, n_samples):
 
 
 
+
 def sim_cna(means, variances, n_samples):
     """
-    Simulate CNA values using a Negative Binomial distribution.
+    Simulate CNA values using Binomial or Negative Binomial distribution 
+    based on the relationship between mean and variance.
 
     Parameters
     ----------
-    means : array-like or pd.Series, shape (n_genes,)
+    means : pd.Series, shape (n_genes,)
         Mean CNA values per gene.
-    variances : array-like or pd.Series, shape (n_genes,)
+    variances : pd.Series, shape (n_genes,)
         Variance of CNA values per gene.
     n_samples : int
         Number of samples to simulate.
@@ -57,108 +59,115 @@ def sim_cna(means, variances, n_samples):
         Simulated CNA values.
     """
     n_genes = len(means)
-    cna_test = np.zeros((n_samples, n_genes))
+    sim_cna = np.zeros((n_samples, n_genes))
 
     for i in range(n_genes):
         mu = means.iloc[i]
         var = variances.iloc[i]
 
-    if var <= mu or not np.isfinite(var):
-        var = mu + max(1e-2, mu * 0.05)
+        if not np.isfinite(mu) or not np.isfinite(var) or mu <= 0:
+            continue
 
-        r = mu**2 / (var - mu)
-        p = r / (r + mu)
+        if var <= mu:
+            # Binomial Distribution
+            p = 1 - (var/mu)
+            n = mu/p
+            sim_cna[:, i] = np.random.binomial(n=n, p=p, size=n_samples)
+        else:
+            # Use Negative Binomial: variance > mean
+            r = mu**2 / (var - mu)
+            p = r / (r + mu)
+            sim_cna[:, i] = nbinom.rvs(n=r, p=p, size=n_samples)
 
-        # Sample from Negative Binomial
-        cna_test[:, i] = nbinom.rvs(n=r, p=p, size=n_samples)
-
-        return cna_test
+    return sim_cna
 
 
-def sim_by_cluster(mut, cna, subtype, n_samples):
+
+def sim_by_cluster(mut, subtype, n_samples, cna=None, fusions=None):
     """
-    Simulate mutational and copy number data by subtype cluster.
+    Simulate mutation, CNA, and/or fusion data stratified by subtype.
 
     Parameters
     ----------
     mut : pd.DataFrame
         Binary mutation matrix (samples × genes).
-    cna : pd.DataFrame
-        Log2 CNA matrix (samples × genes).
     subtype : pd.DataFrame
-        DataFrame with a 'Subtype' column indexed by sample.
+        DataFrame with 'Subtype' column, indexed by sample.
     n_samples : int
         Total number of samples to simulate.
+    cna : pd.DataFrame, optional
+        CNA matrix (samples × genes), typically continuous.
+    fusions : pd.DataFrame, optional
+        Binary fusion matrix (samples × fusions).
 
     Returns
     -------
-    synthetic_mut : pd.DataFrame
-        Simulated mutation matrix.
-    synthetic_cna : pd.DataFrame
-        Simulated CNA matrix.
+    dict
+        Dictionary with keys corresponding to each simulated data type.
+        e.g. {'mut': synthetic_mut, 'fusion': synthetic_fusion, 'cna': synthetic_cna}
     """
+    # Combine mutation and subtype
     M = pd.concat([mut, subtype], axis=1)
-    C = pd.concat([cna, subtype], axis=1)
+
+    if fusions is not None:
+        F = pd.concat([fusions, subtype], axis=1)
+    if cna is not None:
+        C = pd.concat([cna, subtype], axis=1)
+
+    # Count subtype distributions
+    
     subtype_counts = subtype['Subtype'].value_counts()
     subtypes = subtype_counts.index.tolist()
-
     proportions = subtype_counts / subtype_counts.sum()
 
-    # Step 2: Get rounded sample sizes
+    # Compute sample sizes per cluster
     rounded_sizes = (proportions * n_samples).round().astype(int)
-
-    # Step 3: Adjust the last subtype to make total exactly 600
-    difference = n_samples - rounded_sizes.sum()
-    rounded_sizes.iloc[-1] += difference  # may be negative or positive
-
+    rounded_sizes.iloc[-1] += n_samples - rounded_sizes.sum()  # Adjust total
 
     new_mut = []
-    new_cna = []
+    new_fusions = [] if fusions is not None else None
+    new_cna = [] if cna is not None else None
 
     for s, n in zip(subtypes, rounded_sizes):
-        # Subtype-specific samples
+        # Subtype-specific splits
         M_s = M[M['Subtype'] == s].drop(columns='Subtype')
-        C_s = C[C['Subtype'] == s].drop(columns='Subtype')
-
-        # Estimate mutation probabilities
+        M_s = M_s.apply(pd.to_numeric, errors='coerce')
         mut_probs = M_s.mean(axis=0).fillna(0).clip(0, 1)
-
-        # Shift CNA to be non-negative for Poisson
-        means = C_s.mean()
-        var = C_s.var()
-        # # Drop genes with NaNs
-        # valid_genes = means.index[~(means.isna() | var.isna())]
-        # means = means[valid_genes]
-        # var = var[valid_genes]
-
-        # Simulate mutations and CNAs
         mut_cluster = sim_mut(mut_probs, n_samples=n)
-        cna_cluster = sim_cna(means, var, n_samples=n)
-
         new_mut.append(mut_cluster)
-        new_cna.append(cna_cluster)
 
-    # Recombine cluster-wise results
+        if fusions is not None:
+            F_s = F[F['Subtype'] == s].drop(columns='Subtype')
+            F_s = F_s.apply(pd.to_numeric, errors='coerce')
+            fus_probs = F_s.mean(axis=0).fillna(0).clip(0, 1)
+            fus_cluster = sim_mut(fus_probs, n_samples=n)
+            new_fusions.append(fus_cluster)
+
+        if cna is not None:
+            C_s = C[C['Subtype'] == s].drop(columns='Subtype')
+            means = C_s.mean()
+            var = C_s.var()
+            cna_cluster = sim_cna(means, var, n_samples=n)
+            new_cna.append(cna_cluster)
+
+    # Assemble final outputs
     sample_names = [f"Sample_{i+1}" for i in range(n_samples)]
+    output = {
+        'mut': pd.DataFrame(np.vstack(new_mut), columns=mut.columns, index=sample_names)
+    }
 
-    synthetic_mut = pd.DataFrame(np.vstack(new_mut), columns=mut.columns, index=sample_names)
-    synthetic_cna = pd.DataFrame(np.vstack(new_cna), columns=cna.columns, index=sample_names)
+    if fusions is not None:
+        output['fusion'] = pd.DataFrame(np.vstack(new_fusions), columns=fusions.columns, index=sample_names)
 
-    return synthetic_mut, synthetic_cna
+    if cna is not None:
+        output['cna'] = pd.DataFrame(np.vstack(new_cna), columns=cna.columns, index=sample_names)
+
+    return output
 
 """
 EXPRESSION  SIMULATION FUNCTIONS
 """
 
-"""
-EXPRESSION SIMULATION FUNCTIONS
-"""
-
-import numpy as np
-import pandas as pd
-import random
-from scipy.stats import nbinom
-from pydeseq2.dds import DeseqDataSet
 
 
 def estimate_deseq2_parameters(rna_df, size_factor_sd=0.2, seed=None, condition='A'):
@@ -170,7 +179,9 @@ def estimate_deseq2_parameters(rna_df, size_factor_sd=0.2, seed=None, condition=
         np.random.seed(seed)
 
     rna_df = rna_df.round().astype(int)
-    metadata = pd.DataFrame({'condition': [condition] * rna_df.shape[0]}, index=rna_df.index)
+    # Alternate conditions to ensure at least two levels
+    fake_conditions = ['A'] * (rna_df.shape[0] // 2) + ['B'] * (rna_df.shape[0] - rna_df.shape[0] // 2)
+    metadata = pd.DataFrame({'condition': fake_conditions}, index=rna_df.index)
 
     dds = DeseqDataSet(
         counts=rna_df,
@@ -198,23 +209,38 @@ def simulate_rna_background(gene_means, dispersions, size_factors, n_samples):
 
 def generate_signatures(genes, alteration_features, min_size=1, max_size=150):
     """
-    Create random expression signatures for each alteration.
-    Ensures each altered gene is a target of its own signature.
+    Generate random expression signatures for mutations or fusions.
+    For fusions, ensure both partner genes are targets.
     """
     signatures = {}
     for alt in alteration_features:
-        base_gene = alt.split('_')[0]
-        if base_gene not in genes:
-            continue
-        n_targets = random.randint(min_size, max_size)
-        potential_targets = [g for g in genes if g != base_gene]
-        if len(potential_targets) < n_targets - 1:
-            continue
-        targets = [base_gene] + random.sample(potential_targets, k=n_targets - 1)
+        if "_FUSION" in alt:
+            # Fusion case: extract partner genes
+            partners = alt.replace("_FUSION", "").split("-")
+            fusion_targets = [g for g in partners if g in genes]
+
+            # Fill out target list
+            n_targets = random.randint(min_size, max_size)
+            potential_targets = [g for g in genes if g not in fusion_targets]
+            n_remaining = n_targets - len(fusion_targets)
+            if len(potential_targets) < n_remaining:
+                continue
+            targets = fusion_targets + random.sample(potential_targets, k=n_remaining)
+
+        else:
+            base_gene = alt.split('_')[0]
+            if base_gene not in genes:
+                continue
+            n_targets = random.randint(min_size, max_size)
+            potential_targets = [g for g in genes if g != base_gene]
+            if len(potential_targets) < n_targets - 1:
+                continue
+            targets = [base_gene] + random.sample(potential_targets, k=n_targets - 1)
+
+        # Assign random effects (fusion or mutation)
         effects = {t: np.round(np.random.uniform(-2.5, 2.5), 2) for t in targets}
         signatures[alt] = {'targets': targets, 'effects': effects}
     return signatures
-
 
 def inject_expression_effects(expr_df, alteration_df, signatures, cna_df=None):
     """
@@ -231,7 +257,7 @@ def inject_expression_effects(expr_df, alteration_df, signatures, cna_df=None):
                 if alt in signatures and gene in signatures[alt]['targets']:
                     beta_sum += signatures[alt]['effects'][gene]
             copy_factor = cna_df.loc[sample, gene] if (cna_df is not None and gene in cna_df.columns) else 1.0
-            expr_value = (beta_sum + alpha_i) * copy_factor
+            expr_value = (beta_sum + alpha_i) * copy_factor /2
             modified.loc[sample, gene] = max(0, expr_value)
     return modified
 
@@ -250,7 +276,7 @@ def sample_nb(mu, dispersions):
 def simulate_rna_with_signatures(
     rna_df,
     alteration_df,
-    cna_df,
+    cna_df=None,
     n_samples=600,
     min_sig_size=1,
     max_sig_size=150,
@@ -258,40 +284,62 @@ def simulate_rna_with_signatures(
     seed=None
 ):
     """
-    Main simulation function: combines background expression, mutation/CNA effects, and sampling.
+    Simulate RNA-seq counts with expression effects from mutations, fusions, and optional CNAs.
     """
     if seed is not None:
         np.random.seed(seed)
 
+    # Step 1: Estimate RNA-seq parameters
     gene_means, gene_vars, dispersions, size_factors = estimate_deseq2_parameters(rna_df, seed=seed)
-   
-    altered_genes = set([a.split('_')[0] for a in alteration_df.columns])
+
+    # Step 2: Identify genes affected by alterations (including fusion partners)
+    altered_genes = set()
+    for alt in alteration_df.columns:
+        if "_FUSION" in alt:
+            partners = alt.replace("_FUSION", "").split("-")
+            altered_genes.update(partners)
+        else:
+            base_gene = alt.split("_")[0]
+            altered_genes.add(base_gene)
+
+    # Step 3: Select expression genes to simulate
     top_genes = gene_means.sort_values(ascending=False).head(n_genes_to_sim).index
     genes_to_sim = sorted(set(top_genes).union(altered_genes).intersection(rna_df.columns))
 
+    # Step 4: Subset all expression-related objects
     rna_df = rna_df[genes_to_sim]
     gene_means = gene_means[genes_to_sim]
     gene_vars = gene_vars[genes_to_sim]
     dispersions = dispersions[genes_to_sim]
 
-    if all(col.endswith('_CNA') for col in cna_df.columns):
-        cna_df.columns = cna_df.columns.str.replace('_CNA', '', regex=False)
-    cna_df = cna_df.loc[:, cna_df.columns.isin(genes_to_sim)]
+    # Step 5: Subset CNA (if provided)
+    if cna_df is not None:
+        if all(col.endswith('_CNA') for col in cna_df.columns):
+            cna_df = cna_df.copy()
+            cna_df.columns = cna_df.columns.str.replace('_CNA', '', regex=False)
+        cna_df = cna_df.loc[:, cna_df.columns.isin(genes_to_sim)]
 
+    # Step 6: Simulate background expression
     expr_bg = simulate_rna_background(gene_means, dispersions, size_factors[:n_samples], n_samples)
     expr_bg.index = [f"Sample_{i+1}" for i in range(n_samples)]
+
+    # Step 7: Align alteration and CNA data
     alteration_df = alteration_df.copy()
     alteration_df.index = expr_bg.index
     if cna_df is not None:
         cna_df = cna_df.copy()
         cna_df.index = expr_bg.index
 
-
+    # Step 8: Generate signatures (fusion-aware version assumed)
     all_alts = alteration_df.columns.tolist()
     true_signatures = generate_signatures(expr_bg.columns.tolist(), all_alts, min_sig_size, max_sig_size)
 
+    # Step 9: Inject alteration-driven effects
     expr_effected = inject_expression_effects(expr_bg, alteration_df, true_signatures, cna_df)
-    expr_counts = sample_nb(expr_effected.values, dispersions)
 
+    # Step 10: Sample final RNA-seq counts
+    expr_counts = sample_nb(expr_effected.values, dispersions)
     expr_sim = pd.DataFrame(expr_counts, columns=expr_bg.columns, index=expr_bg.index)
+
     return expr_sim, true_signatures
+
