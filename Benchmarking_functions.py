@@ -3,21 +3,39 @@
 # ========================
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
-from sklearn.linear_model import LogisticRegressionCV, LogisticRegression, LassoCV, Lasso, RidgeCV, ElasticNetCV
-from sklearn.svm import SVC, SVR
+
+# Machine learning models
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegressionCV, LogisticRegression, LassoCV, Lasso
+from sklearn.svm import SVC
+
+# Dimensionality reduction / clustering
 from sklearn.decomposition import NMF
 from sklearn.cluster import KMeans
-from sklearn.metrics import silhouette_score
-from scipy.stats import chi2_contingency
+from sklearn.metrics import silhouette_score, adjusted_rand_score, normalized_mutual_info_score
+from sklearn.preprocessing import StandardScaler
+
+# Model evaluation
+from sklearn.model_selection import RepeatedKFold
+
+# Statistics
+from scipy.stats import chi2_contingency, fisher_exact, ttest_ind, mannwhitneyu
+from statsmodels.stats.multitest import multipletests
+
+# Hierarchical clustering
+from scipy.cluster.hierarchy import linkage, cophenet
+from scipy.spatial.distance import squareform
+
+# RNA-seq differential expression
 from pydeseq2.dds import DeseqDataSet
 from pydeseq2.ds import DeseqStats
 from pydeseq2.default_inference import DefaultInference
-from sklearn.model_selection import RepeatedKFold
-import joblib
-from Functions import ppca, predicitve_check
-from sklearn.preprocessing import StandardScaler
-from scipy.stats import chi2_contingency, fisher_exact
+
+# Custom functions
+from Deconfounder import ppca, predicitve_check
+
+# Typing
+from typing import Dict, Tuple, List, Optional
 
 
 # ========================
@@ -112,23 +130,22 @@ def precompute_global_results(X, Y):
 # ========================
 
 def get_lasso_class_signature(X, y):
-    model = LogisticRegressionCV(penalty='l1', solver='liblinear', class_weight='balanced', random_state=44)
+    model = LogisticRegressionCV(penalty='l1', solver='liblinear', class_weight='balanced', random_state=44, cv=10, Cs=50, max_iter=10000)
     model.fit(X, y)
     return X.columns[np.abs(model.coef_[0]) > 0].tolist()
 
 def get_elasticnet_class_signature(X, y):
-    model = LogisticRegressionCV(penalty='elasticnet', solver='saga', class_weight='balanced',
-                                  l1_ratios=[0.5], random_state=44)
+    model = LogisticRegressionCV(penalty='elasticnet', solver='saga', class_weight='balanced', l1_ratios=[0.5], random_state=44, max_iter=10000)
     model.fit(X, y)
     return X.columns[np.abs(model.coef_[0]) > 0].tolist()
 
 def get_svm_class_signature(X, y): 
-    model = SVC(kernel='linear', class_weight='balanced', random_state=44)
+    model = SVC(kernel='linear', class_weight='balanced', random_state=44, max_iter=10000)
     model.fit(X, y)
     return X.columns[np.abs(model.coef_).flatten() > 0.05].tolist() if hasattr(model, 'coef_') else []
 
 def get_ridgereg_class_signature(X, y):
-    model = LogisticRegression(penalty='l2', class_weight='balanced', random_state=44)
+    model = LogisticRegression(penalty='l2', class_weight='balanced', random_state=44, max_iter=10000)
     model.fit(X, y)
     return X.columns[np.abs(model.coef_[0]) > 0.05].tolist()
 
@@ -137,39 +154,6 @@ def get_rf_class_signature(X, y):
     model.fit(X, y)
     return X.columns[model.feature_importances_ > 0.005].tolist()
 
-# ========================
-# Linear Regression Methods
-# ========================
-
-def get_lasso_lin_signature(X, y):
-    model = LassoCV(cv=5, random_state=44, max_iter=5000)
-    model.fit(X, y)
-    return X.columns[np.abs(model.coef_) > 1e-6].tolist()
-
-
-def get_ridge_lin_signature(X, y):
-    model = RidgeCV(alphas=np.logspace(-3, 3, 50))
-    model.fit(X, y)
-    return X.columns[np.abs(model.coef_) > 1e-6].tolist()
-
-
-def get_rf_lin_signature(X, y):
-    model = RandomForestRegressor(n_estimators=500, random_state=44, n_jobs=-1)
-    model.fit(X, y)
-    importances = model.feature_importances_
-    # pick nonzero importance features
-    return X.columns[importances > 0].tolist()
-
-def get_svm_lin_signature(X, y):
-    model = SVR(kernel="linear", C=1.0)
-    model.fit(X, y)
-    coefs = model.coef_.ravel()
-    return X.columns[np.abs(coefs) > 1e-6].tolist()
-
-def get_elasticnet_lin_signature(X, y):
-    en = ElasticNetCV(l1_ratio=[.3, .5, .7], cv=5, random_state=44)
-    en.fit(X, y)
-    return X.columns[np.abs(en.coef_) > 1e-8].tolist()
 
 
 def get_deconfounder_signature(gof, global_results):
@@ -180,126 +164,41 @@ def get_deconfounder_signature(gof, global_results):
     return list(gene_signature.index)
 
 
-
-def get_deseq2_signature_continuous_cna(
-    X_train: pd.DataFrame,
-    Y_counts: pd.DataFrame,
-    gof: str,
-    alpha: float = 0.05,
-):
+def get_deseq2_signature(X, Y, gof):
     """
-    DESeq2 with a continuous CNA covariate (already centered).
-    Model: counts ~ cna_ctr
-    Returns (significant_gene_list, full_results_df)
+    X_train: mutation/CNA/fusion matrix
+    Y_train: gene expression count matrix (int)
+    gof: alteration of interest
     """
-    # Align samples
-    idx = Y_counts.index.intersection(X_train.index)
-    counts_df = Y_counts.loc[idx].round().astype(int)
-
-    # Centered CNA vector (you said it's pre-centered already)
-    cna_ctr = X_train.loc[idx, gof].astype(float)
-    if cna_ctr.nunique() <= 1:
-        raise ValueError(f"{gof}: no variance in CNA vector (all values equal).")
-
-    # Design (metadata)
-    meta = pd.DataFrame({"cna_ctr": cna_ctr}, index=idx)
-
-    # Fit DESeq2
+    metadata = X.copy()
+    counts_df = Y.astype(int)
     inference = DefaultInference(n_cpus=8)
+
+    # Make sure it's binary categorical
+    metadata[gof] = metadata[gof].astype(str).astype("category")
+    metadata[gof] = metadata[gof].cat.reorder_categories(["0", "1"], ordered=True)
+
     dds = DeseqDataSet(
         counts=counts_df,
-        metadata=meta,
-        design_factors=["cna_ctr"],   # treat as continuous covariate
+        metadata=metadata,
+        design_factors=[gof],
         refit_cooks=True,
+        inference=inference,
     )
     dds.deseq2()
 
-    # Pull coefficient for the continuous term
-    stats = DeseqStats(dds, name="cna_ctr", inference=inference)  # <-- use name=, not contrast=
-    stats.summary()
-    res = (stats.results_df
-           .rename(columns={
-               "log2FoldChange": "log2FC_per_copy",
-               "lfcSE": "SE",
-               "stat": "Wald_stat",
-               "pvalue": "pval",
-               "padj": "qval",
-               "baseMean": "baseMean",
-           })
-           .sort_values("pval"))
+    contrast = [gof, "1", "0"]
+    stat_res = DeseqStats(dds, contrast=contrast, inference=inference)
+    stat_res.summary()
 
-    sig = res[res["qval"] < alpha]
-    return list(sig.index), res
-
-
-def get_deseq2_signature_auto(
-    X_train: pd.DataFrame,
-    Y_counts: pd.DataFrame,
-    gof: str,
-    alpha: float = 0.05
-):
-    """
-    If X[gof] is binary (0/1) -> categorical DESeq2 with contrast [gof, "1", "0"].
-    Else -> continuous CNA path above.
-    """
-    vals = pd.unique(X_train[gof].dropna())
-    is_binary = set(vals).issubset({0, 1})
-
-    idx = Y_counts.index.intersection(X_train.index)
-    counts_df = Y_counts.loc[idx].round().astype(int)
-    inference = DefaultInference(n_cpus=8)
-
-    if is_binary:
-        meta = X_train.loc[idx, [gof]].copy()
-        # ensure strings "0","1" with "0" as reference
-        meta[gof] = meta[gof].astype(int).astype(str).astype("category")
-        if {"0", "1"}.issubset(set(meta[gof].cat.categories)):
-            meta[gof] = meta[gof].cat.reorder_categories(["0", "1"], ordered=True)
-
-        dds = DeseqDataSet(
-            counts=counts_df,
-            metadata=meta,
-            design_factors=[gof],
-            refit_cooks=True,
-        )
-        dds.deseq2()
-
-        stats = DeseqStats(dds, contrast=[gof, "1", "0"], inference=inference)
-        stats.summary()
-        res = (stats.results_df
-               .rename(columns={
-                   "log2FoldChange": "log2FC",
-                   "lfcSE": "SE",
-                   "stat": "Wald_stat",
-                   "pvalue": "pval",
-                   "padj": "qval",
-                   "baseMean": "baseMean",
-               })
-               .sort_values("pval"))
-        sig = res[res["qval"] < alpha]
-        return list(sig.index), res
-
-    # Continuous (already centered) CNA
-    return get_deseq2_signature_continuous_cna(X_train, Y_counts, gof, alpha=alpha)
-
-
-def get_deseq2_signature_auto_list(X, Y_counts, gof, alpha=0.05):
-    sig_list, _ = get_deseq2_signature_auto(X, Y_counts, gof, alpha)
-    return sig_list
+    de = stat_res.results_df
+    significant_genes = de[de['padj'] < 0.05]
+    return list(significant_genes.index)
 
 # ========================
 # Wrapper: Create Supervised Signatures
 # ========================
 
-def is_cna(col: str) -> bool:
-    return col.endswith("_CNA") or col.endswith("_CNA_CNA")
-
-def is_binary_col(col: str) -> bool:
-    return col.endswith("_MUT") or col.endswith("_FUSION")
-
-def is_binary_vector(x: pd.Series) -> bool:
-    vals = pd.unique(x.dropna())
-    return set(vals).issubset({0, 1})
 
 def normalize_counts_log_cpm(Y_counts, libsize_target=1e4):
     """CPM-like scaling + log1p, then z-score per gene; returns DataFrame with same index/cols."""
@@ -323,16 +222,6 @@ def class_supervised_signatures(Y_norm_df, x):
     signatures['Ridge Regression']  = get_ridgereg_class_signature(Y_norm_df, x)
     return signatures
 
-def reg_supervised_signatures(Y_norm_df, x):
-    """Build CNA signatures via regressors: X=RNA, y=CNA (continuous/centered or raw)."""
-    signatures = {}
-    signatures['Random Forest']        = get_rf_lin_signature(Y_norm_df, x)
-    signatures['Lasso']                = get_lasso_lin_signature(Y_norm_df, x)
-    signatures['ElasticNet']           = get_elasticnet_lin_signature(Y_norm_df, x)
-    signatures['SVM']                  = get_svm_lin_signature(Y_norm_df, x)
-    signatures['Ridge Regression']     = get_ridge_lin_signature(Y_norm_df, x)  # <-- label fixed
-    return signatures
-
 
 def create_supervised_signatures(X, Y, gof, global_results = None):
     """
@@ -353,17 +242,13 @@ def create_supervised_signatures(X, Y, gof, global_results = None):
     # normalize RNA for ML models (NOT for DESeq2)
     Y_norm_df = normalize_counts_log_cpm(Y)
 
-    # pick path by alteration type (binary vs continuous) using the actual vector
-    if is_binary_vector(x):
-        signatures = class_supervised_signatures(Y_norm_df, x)
-    else:
-        signatures = reg_supervised_signatures(Y_norm_df, x)
+    signatures = class_supervised_signatures(Y_norm_df, x)
 
     # add extra methods
     if global_results is not None:
         signatures['Deconfounder'] = get_deconfounder_signature(gof, global_results)
 
-    signatures['DESeq2'] = get_deseq2_signature_auto_list(X, Y, gof)
+    signatures['DESeq2'] = get_deseq2_signature(X, Y, gof)
 
     return signatures
 
@@ -372,214 +257,395 @@ def create_supervised_signatures(X, Y, gof, global_results = None):
 # Unsupervised Methods
 # ========================
 
-def create_signatures_kmeans(X, Y, method_name='K-means', verbose=True, min_cluster_size=5, pval_thresh=0.2):
-    from scipy.stats import fisher_exact, chi2_contingency
-    from sklearn.cluster import KMeans
-    from sklearn.metrics import silhouette_score
-    import pandas as pd
-    import matplotlib.pyplot as plt
-    import os
+# =========================
+# Step 1 — Variable selection
+# =========================
+def filter_and_select_hvgs(
+    Y: pd.DataFrame,
+    min_mean: float = 1.0,
+    top_n: int = 2000
+) -> pd.DataFrame:
+    """Filter low-expression genes then keep top-N HVGs by variance."""
+    Yf = Y.loc[:, Y.mean(axis=0) >= min_mean]
+    if Yf.shape[1] == 0:
+        raise ValueError("All genes removed by min_mean filter; lower min_mean.")
+    var = Yf.var(axis=0).sort_values(ascending=False)
+    keep = var.head(min(top_n, len(var))).index
+    return Yf[keep]
 
-    km_signatures = {}
-    Y_scaled_df = pd.DataFrame(Y, index=Y.index, columns=Y.columns)
 
-    scores = {}
-    for k in range(2, 21):
-        try:
-            kmeans = KMeans(n_clusters=k, random_state=44).fit(Y)
-            score = silhouette_score(Y, kmeans.labels_)
-            scores[k] = score
-        except Exception as e:
-            print(f"[{method_name}] Failed clustering for k={k}: {e}")
+# =========================
+# Step 2 — Consensus NMF & pick k by cophenetic
+# =========================
+def _consensus_from_labels(labels_2d: List[np.ndarray]) -> np.ndarray:
+    """
+    Build consensus co-assignment matrix from many label vectors.
+    labels_2d: list of label arrays, each length n.
+    Returns: (n x n) consensus matrix in [0,1].
+    """
+    n = len(labels_2d[0])
+    C = np.zeros((n, n), dtype=float)
+    for labs in labels_2d:
+        same = (labs[:, None] == labs[None, :]).astype(float)
+        C += same
+    C /= len(labels_2d)
+    np.fill_diagonal(C, 1.0)
+    return C
 
-    if not scores:
-        print(f"[{method_name}] No valid clustering configurations succeeded.")
-        return {}
 
-    best_k = max(scores, key=scores.get)
-    if verbose:
-        print(f"[{method_name}] Best k={best_k}, Silhouette scores: {scores}")
+def _cophenetic_from_consensus(C: np.ndarray) -> float:
+    """
+    Cophenetic correlation of (1 - consensus) distance matrix.
+    """
+    # convert to condensed distance for linkage
+    D = 1.0 - C
+    # ensure symmetry
+    D = (D + D.T) / 2.0
+    dvec = squareform(D, checks=False)
+    Z = linkage(dvec, method="average")
+    coph, _ = cophenet(Z, dvec)
+    return float(coph)
 
-    cluster_labels = pd.Series(KMeans(n_clusters=best_k, random_state=44).fit_predict(Y), index=Y.index)
-    cluster_sizes = cluster_labels.value_counts().to_dict()
-    if verbose:
-        print(f"[{method_name}] Cluster distribution: {cluster_sizes}")
 
-    if any(count < min_cluster_size for count in cluster_sizes.values()):
-        print(f"[{method_name}] Warning: One or more clusters have <{min_cluster_size} samples.")
+def consensus_nmf_select_k(
+    Y: pd.DataFrame,
+    k_range=range(2, 8),
+    n_runs: int = 50,
+    sample_frac: float = 0.9,
+    gene_frac: float = 0.9,
+    nmf_components_cap: Optional[int] = 50,
+    random_state: int = 44,
+) -> Tuple[int, Dict[int, float], Dict[int, np.ndarray], Dict[int, Dict]]:
+    """
+    Run consensus NMF over k; pick k with highest cophenetic (TCGA-style).
+    Returns:
+      best_k,
+      cophenetic_by_k,
+      labels_by_k (labels from final run at each k),
+      artifacts_by_k (W, H, final_kmeans, etc.)
+    """
+    rng = np.random.default_rng(random_state)
+    n, g = Y.shape
+    labels_by_k = {}
+    artifacts_by_k = {}
+    coph = {}
 
-    mutation_pvals = []
-    for mutation in X.columns:
-        for cluster in sorted(cluster_labels.unique()):
-            try:
-                contingency = pd.crosstab((cluster_labels == cluster).astype(int), X[mutation])
-                if contingency.shape != (2, 2):
-                    continue
-                if (contingency.values < 5).any():
-                    _, p = fisher_exact(contingency)
-                else:
-                    _, p, _, _ = chi2_contingency(contingency)
-                mutation_pvals.append({'Mutation': mutation, 'Cluster': cluster, 'p_value': p})
-            except Exception as e:
-                print(f"[{method_name}] Warning: Stat test failed for {mutation} – {e}")
+    for k in k_range:
+        # For OV, k=4 often maxes stability; but we compute rather than assume
+        label_runs = []
+        for run in range(n_runs):
+            # bootstrap subsampling
+            rows = rng.choice(n, size=max(2, int(sample_frac * n)), replace=False)
+            cols = rng.choice(g, size=max(2, int(gene_frac * g)), replace=False)
+            Ysub = Y.iloc[rows, cols]
 
-    pvals_df = pd.DataFrame(mutation_pvals)
-    cluster_labels.to_csv(f"{method_name}_cluster_labels.csv")
-    pvals_df.to_csv(f"{method_name}_pvals.csv")
+            # NMF on non-negative
+            Ynn = Ysub.clip(lower=0)
+            r = min(nmf_components_cap or k, Ynn.shape[1])
+            r = max(r, k)  # ensure r >= k
+            nmf = NMF(n_components=r, init="nndsvda", random_state=run + random_state, max_iter=600)
+            W = nmf.fit_transform(Ynn)
+            # cluster in W with KMeans (k groups)
+            km = KMeans(n_clusters=k, n_init='auto', random_state=run + random_state)
+            labs = km.fit_predict(W)
 
-    # Plot histogram
-    plt.figure()
-    pvals_df['p_value'].hist(bins=40)
-    plt.axvline(pval_thresh, color='red', linestyle='--', label='Threshold')
-    plt.title(f"{method_name} p-value distribution")
-    plt.xlabel("p-value")
-    plt.ylabel("Count")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(f"{method_name}_pval_hist.png")
-    plt.close()
+            # Map back to full index with -1 default
+            labs_full = -np.ones(n, dtype=int)
+            labs_full[rows] = labs
+            label_runs.append(labs_full)
 
-    # Filter associations
-    filtered = pvals_df[pvals_df['p_value'] < pval_thresh]
-    if filtered.empty:
-        print(f"[{method_name}] No associations passed p-value < {pval_thresh}")
-        return {}
+        # consensus from runs that labeled the same subset of samples:
+        # Only count pairs co-labeled in each run (ignore -1 rows for that run)
+        # A simple and robust trick: build C as average over runs of pairwise
+        # equality but treat -1 as its own label and zero out rows/cols with -1
+        # per run.
+        C = np.zeros((n, n), dtype=float)
+        counts = np.zeros((n, n), dtype=float)
+        for labs in label_runs:
+            mask = labs != -1
+            idx = np.where(mask)[0]
+            li = labs[mask]
+            same = (li[:, None] == li[None, :]).astype(float)
+            # add to C/counts for observed indices
+            C[np.ix_(idx, idx)] += same
+            counts[np.ix_(idx, idx)] += 1.0
+        with np.errstate(invalid="ignore", divide="ignore"):
+            C = np.divide(C, counts, out=np.zeros_like(C), where=counts > 0)
+        np.fill_diagonal(C, 1.0)
 
-    best_assoc = filtered.sort_values('p_value').drop_duplicates('Mutation')
+        # cophenetic on consensus
+        coph[k] = _cophenetic_from_consensus(C)
 
-    mean_expr = Y_scaled_df.groupby(cluster_labels).mean()
-    defining_genes_dict = {
-        cluster: mean_expr.loc[cluster].sort_values(ascending=False).head(50).index.tolist()
-        for cluster in cluster_labels.unique()
+        # final fit at full data to get labels/artifacts for this k
+        Ynn_full = Y.clip(lower=0)
+        r_full = max(k, min(nmf_components_cap or k, Ynn_full.shape[1]))
+        nmf_final = NMF(n_components=r_full, init="nndsvda", random_state=random_state, max_iter=800)
+        W_full = nmf_final.fit_transform(Ynn_full)
+        H_full = nmf_final.components_
+        km_final = KMeans(n_clusters=k, n_init='auto', random_state=random_state).fit(W_full)
+        labels_by_k[k] = km_final.labels_
+        artifacts_by_k[k] = {
+            "W": pd.DataFrame(W_full, index=Y.index, columns=[f"NMF_{i}" for i in range(r_full)]),
+            "H": pd.DataFrame(H_full, columns=Y.columns, index=[f"NMF_{i}" for i in range(r_full)]),
+            "kmeans": km_final,
+            "consensus": C,
+        }
+
+    # choose k with max cophenetic
+    best_k = max(coph, key=coph.get)
+    return best_k, coph, labels_by_k, artifacts_by_k
+
+
+# =========================
+# Step 3 — Final NMF→KMeans labels
+# =========================
+def final_nmf_kmeans_labels(artifacts_by_k: Dict[int, Dict], k: int) -> Tuple[pd.Series, pd.DataFrame, pd.DataFrame]:
+    art = artifacts_by_k[k]
+    W, H, km = art["W"], art["H"], art["kmeans"]
+    labels = pd.Series(km.labels_, index=W.index, name="cluster")
+    return labels, W, H
+
+
+# =========================
+# Step 4 — KMeans (gene space) cross-check
+# =========================
+def kmeans_gene_space(Y_hvg: pd.DataFrame, k: int, random_state=44) -> pd.Series:
+    km = KMeans(n_clusters=k, n_init='auto', random_state=random_state)
+    labs = km.fit_predict(Y_hvg)
+    return pd.Series(labs, index=Y_hvg.index, name="cluster_km_gene")
+
+
+def overlap_metrics(a: pd.Series, b: pd.Series) -> Dict[str, float]:
+    a, b = a.loc[a.index], b.loc[a.index]
+    return {
+        "ARI": adjusted_rand_score(a, b),
+        "NMI": normalized_mutual_info_score(a, b)
     }
 
-    for cluster in sorted(cluster_labels.unique()):
-        assoc_mut = best_assoc[best_assoc['Cluster'] == cluster]
-        top_mutation = assoc_mut.sort_values('p_value').head(1)['Mutation'].values if not assoc_mut.empty else [f"Cluster_{cluster}_placeholder"]
-        defining_genes = defining_genes_dict.get(cluster, [])
-        km_signatures.setdefault(method_name, {})[top_mutation[0]] = defining_genes
 
-    return km_signatures
+# =========================
+# Alteration association testing (with frequency filters)
+# =========================
+def prepare_alterations_binary(
+    X: pd.DataFrame,
+    cna_suffix: str = "_CNA",
+    min_freq: float = 0.05,
+    max_freq: float = 0.90
+) -> pd.DataFrame:
+    """
+    Ensure binary; auto-binarize CNAs (any change != 0 → 1), and keep 5–90% frequency.
+    """
+    Xb = X.copy()
+    for c in Xb.columns:
+        if c.endswith(cna_suffix):
+            Xb[c] = (Xb[c] != 0).astype(int)
+    # keep binary only
+    Xb = Xb.loc[:, Xb.nunique() == 2]
+    # frequency filter
+    freq = Xb.mean(axis=0)
+    keep = (freq >= min_freq) & (freq <= max_freq)
+    return Xb.loc[:, keep]
 
 
-def create_kmeans_nmf_signature(Y, X, method_name='NMF-KMeans', n_components=20, verbose=True, min_cluster_size=5, pval_thresh=0.2):
-    from scipy.stats import fisher_exact, chi2_contingency
-    from sklearn.decomposition import NMF
-    from sklearn.cluster import KMeans
-    from sklearn.metrics import silhouette_score
-    import pandas as pd
-    import matplotlib.pyplot as plt
-
-    all_signatures = {}
-
-    try:
-        nmf_model = NMF(n_components=n_components, init='random', random_state=44, max_iter=1000)
-        W = nmf_model.fit_transform(Y.abs())
-        H = nmf_model.components_
-    except Exception as e:
-        print(f"[{method_name}] NMF failed: {e}")
-        return {}
-
-    W_df = pd.DataFrame(W, index=Y.index, columns=[f'NMF_{i}' for i in range(n_components)])
-    H_df = pd.DataFrame(H, columns=Y.columns, index=[f'NMF_{i}' for i in range(n_components)])
-
-    scores = {}
-    for k in range(2, 21):
+def cluster_alteration_associations(
+    labels: pd.Series,
+    Xb: pd.DataFrame
+) -> pd.DataFrame:
+    """
+    Global χ² across clusters + per-cluster (cluster vs rest) Fisher/χ².
+    Returns tidy table with raw p-values and FDR.
+    """
+    L = labels.astype(int)
+    recs = []
+    for feat in Xb.columns:
+        v = Xb[feat]
+        tab = pd.crosstab(L, v)
+        if tab.shape[1] < 2:
+            continue
+        # global across all clusters
         try:
-            kmeans = KMeans(n_clusters=k, random_state=44).fit(W_df)
-            score = silhouette_score(W_df, kmeans.labels_)
-            scores[k] = score
-        except Exception as e:
-            print(f"[{method_name}] Failed clustering for k={k}: {e}")
+            _, p_global, _, _ = chi2_contingency(tab)
+        except Exception:
+            p_global = 1.0
+        # per-cluster (2x2)
+        for c in sorted(L.unique()):
+            in_c = (L == c).astype(int)
+            t22 = pd.crosstab(in_c, v)
+            if t22.shape != (2, 2):
+                continue
+            if (t22.values < 5).any():
+                _, p = fisher_exact(t22)
+            else:
+                _, p, _, _ = chi2_contingency(t22)
+            recs.append({
+                "alteration": feat,
+                "cluster": int(c),
+                "pval": p,
+                "pval_global": p_global
+            })
+    out = pd.DataFrame(recs)
+    if out.empty:
+        return out
+    out["fdr"] = multipletests(out["pval"], method="fdr_bh")[1]
+    out["fdr_global"] = multipletests(out["pval_global"], method="fdr_bh")[1]
+    return out.sort_values(["fdr", "pval"])
 
-    if not scores:
-        print(f"[{method_name}] No valid clustering configurations succeeded.")
-        return {}
 
-    best_k = max(scores, key=scores.get)
-    if verbose:
-        print(f"[{method_name}] Best k={best_k}, Silhouette scores: {scores}")
-
-    cluster_labels = pd.Series(KMeans(n_clusters=best_k, random_state=44).fit_predict(W_df), index=Y.index)
-    cluster_sizes = cluster_labels.value_counts().to_dict()
-    if verbose:
-        print(f"[{method_name}] Cluster distribution: {cluster_sizes}")
-
-    if any(count < min_cluster_size for count in cluster_sizes.values()):
-        print(f"[{method_name}] Warning: One or more clusters have <{min_cluster_size} samples.")
-
-    mutation_pvals = []
-    for mutation in X.columns:
-        for cluster in sorted(cluster_labels.unique()):
+# =========================
+# Cluster-vs-rest differential expression
+# =========================
+def de_cluster_vs_rest(
+    Y: pd.DataFrame,
+    labels: pd.Series,
+    target_cluster: int,
+    test: str = "ttest",
+    fdr_thresh: Optional[float] = 0.1,
+    top_n: int = 50
+) -> List[str]:
+    """
+    Return top_n DE genes (by FDR then effect size) for cluster vs rest.
+    """
+    mask = labels == target_cluster
+    rows = []
+    for g in Y.columns:
+        a, b = Y.loc[mask, g].values, Y.loc[~mask, g].values
+        if test == "wilcoxon":
             try:
-                contingency = pd.crosstab((cluster_labels == cluster).astype(int), X[mutation])
-                if contingency.shape != (2, 2):
+                stat, p = mannwhitneyu(a, b, alternative="two-sided")
+            except Exception:
+                p = 1.0
+        else:
+            stat, p = ttest_ind(a, b, equal_var=False, nan_policy="omit")
+        eff = np.nanmean(a) - np.nanmean(b)
+        rows.append((g, p, eff))
+    df = pd.DataFrame(rows, columns=["gene", "pval", "effect"])
+    df["fdr"] = multipletests(df["pval"], method="fdr_bh")[1]
+    df = df.sort_values(["fdr", "effect"], ascending=[True, False])
+    if fdr_thresh is not None:
+        df = df[df["fdr"] <= fdr_thresh]
+    return df.head(top_n)["gene"].tolist()
+
+
+# =========================
+# Wrapper to produce your signature dict
+# =========================
+def run_tcga_style_ov_pipeline(
+    Y: pd.DataFrame,            # samples x genes (raw CPM/TPM or already log1p)
+    X: pd.DataFrame,            # samples x alterations (mut/fus + CNA integers or binary)
+    method_names = ("NMF-KMeans", "K-means"),
+    min_mean=1.0,
+    top_n_hvg=2000,
+    k_range=range(2, 8),
+    n_runs=50,
+    freq_min=0.05,
+    freq_max=0.90,
+    fdr_thresh=0.1,
+    de_top_n=50,
+    force_k: Optional[int] = None,
+    random_state=44,
+) -> Dict[str, Dict[str, List[str]]]:
+    """
+    Returns: { 'NMF-KMeans': {alteration: [genes...]}, 'K-means': {...} }
+    Also saves helpful CSVs on disk (labels, assoc tables).
+    """
+    # --- Normalize Y like TCGA-style (library size -> log1p) if Y seems raw
+    s = Y.sum(axis=1).replace(0, np.nan)
+    scale = (10000 / s).fillna(0.0)
+    Y_norm = np.log1p(Y.mul(scale, axis=0))
+    # HVGs
+    Y_hvg = filter_and_select_hvgs(Y_norm, min_mean=min_mean, top_n=top_n_hvg)
+
+    # --- Prepare alterations (binary + frequency filtered)
+    Xb = prepare_alterations_binary(X, min_freq=freq_min, max_freq=freq_max)
+    # align indices
+    common = Y_hvg.index.intersection(Xb.index)
+    Y_hvg, Xb = Y_hvg.loc[common], Xb.loc[common]
+
+    out = {}
+
+    # ====== Method A: consensus NMF → KMeans ======
+    if "NMF-KMeans" in method_names:
+        best_k, coph, labels_by_k, artifacts_by_k = consensus_nmf_select_k(
+            Y_hvg, k_range=k_range, n_runs=n_runs, random_state=random_state
+        )
+        k_use = force_k if force_k is not None else best_k
+        labels_nmf, W, H = final_nmf_kmeans_labels(artifacts_by_k, k_use)
+
+        # Save diagnostics
+        pd.Series(labels_nmf, name="cluster").to_csv("NMF-KMeans_cluster_labels.csv")
+        pd.DataFrame({"k": list(coph.keys()), "cophenetic": list(coph.values())}).to_csv(
+            "NMF-KMeans_cophenetic.csv", index=False
+        )
+
+        # Associations
+        assoc = cluster_alteration_associations(labels_nmf, Xb)
+        assoc.to_csv("NMF-KMeans_alteration_assoc.csv", index=False)
+
+        # Build signatures: top alteration per cluster (by FDR), then DE genes
+        signatures_nmf = {}
+        if assoc.empty:
+            # still produce placeholders
+            for c in sorted(labels_nmf.unique()):
+                genes = de_cluster_vs_rest(Y_hvg, labels_nmf, c, fdr_thresh=fdr_thresh, top_n=de_top_n)
+                signatures_nmf[f"Cluster_{c}_placeholder"] = genes
+        else:
+            sig = assoc.sort_values(["fdr", "pval"])
+            for c in sorted(labels_nmf.unique()):
+                sub = sig[sig["cluster"] == c]
+                key = sub.iloc[0]["alteration"] if not sub.empty else f"Cluster_{c}_placeholder"
+                genes = de_cluster_vs_rest(Y_hvg, labels_nmf, c, fdr_thresh=fdr_thresh, top_n=de_top_n)
+                signatures_nmf[key] = genes
+        out["NMF-KMeans"] = signatures_nmf
+
+        # Cross-check with gene-space KMeans
+        km_gene_labels = kmeans_gene_space(Y_hvg, k=k_use, random_state=random_state)
+        pd.Series(km_gene_labels, name="cluster").to_csv("KMeansGene_cluster_labels.csv")
+        ovlp = overlap_metrics(labels_nmf, km_gene_labels)
+        pd.DataFrame([ovlp]).to_csv("NMF_vs_KMeansGene_overlap.csv", index=False)
+
+    # ====== Method B: plain KMeans in gene space (HVGs) ======
+    if "K-means" in method_names:
+        # pick k by silhouette (gene space) but allow force_k
+        scores = {}
+        for k in k_range:
+            try:
+                km_labs = kmeans_gene_space(Y_hvg, k=k, random_state=random_state)
+                if len(np.unique(km_labs)) < 2:
                     continue
-                if (contingency.values < 5).any():
-                    _, p = fisher_exact(contingency)
-                else:
-                    _, p, _, _ = chi2_contingency(contingency)
-                mutation_pvals.append({'Mutation': mutation, 'Cluster': cluster, 'p_value': p})
-            except Exception as e:
-                print(f"[{method_name}] Warning: Stat test failed for {mutation} – {e}")
+                scores[k] = silhouette_score(Y_hvg, km_labs)
+            except Exception:
+                pass
+        if len(scores) == 0:
+            # degenerate case: fall back to k=2
+            k_km = force_k if force_k is not None else 2
+        else:
+            best_km = max(scores, key=scores.get)
+            k_km = force_k if force_k is not None else best_km
 
-    pvals_df = pd.DataFrame(mutation_pvals)
-    cluster_labels.to_csv(f"{method_name}_cluster_labels.csv")
-    pvals_df.to_csv(f"{method_name}_pvals.csv")
+        labels_km = kmeans_gene_space(Y_hvg, k=k_km, random_state=random_state)
+        pd.Series(labels_km, name="cluster").to_csv("K-means_cluster_labels.csv")
+        pd.DataFrame({"k": list(scores.keys()), "silhouette": list(scores.values())}).to_csv(
+            "K-means_silhouette.csv", index=False
+        )
 
-    # Plot histogram
-    plt.figure()
-    pvals_df['p_value'].hist(bins=40)
-    plt.axvline(pval_thresh, color='red', linestyle='--', label='Threshold')
-    plt.title(f"{method_name} p-value distribution")
-    plt.xlabel("p-value")
-    plt.ylabel("Count")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(f"{method_name}_pval_hist.png")
-    plt.close()
+        assoc_km = cluster_alteration_associations(labels_km, Xb)
+        assoc_km.to_csv("K-means_alteration_assoc.csv", index=False)
 
-    # Filter associations
-    filtered = pvals_df[pvals_df['p_value'] < pval_thresh]
-    if filtered.empty:
-        print(f"[{method_name}] No associations passed p-value < {pval_thresh}")
-        return {}
+        signatures_km = {}
+        if assoc_km.empty:
+            for c in sorted(labels_km.unique()):
+                genes = de_cluster_vs_rest(Y_hvg, labels_km, c, fdr_thresh=fdr_thresh, top_n=de_top_n)
+                signatures_km[f"Cluster_{c}_placeholder"] = genes
+        else:
+            sig = assoc_km.sort_values(["fdr", "pval"])
+            for c in sorted(labels_km.unique()):
+                sub = sig[sig["cluster"] == c]
+                key = sub.iloc[0]["alteration"] if not sub.empty else f"Cluster_{c}_placeholder"
+                genes = de_cluster_vs_rest(Y_hvg, labels_km, c, fdr_thresh=fdr_thresh, top_n=de_top_n)
+                signatures_km[key] = genes
+        out["K-means"] = signatures_km
 
-    best_assoc = filtered.sort_values('p_value').drop_duplicates('Mutation')
-
-    mean_nmf = W_df.groupby(cluster_labels).mean()
-    defining_genes_dict = {}
-    for cluster in sorted(cluster_labels.unique()):
-        top_component = mean_nmf.loc[cluster].idxmax()
-        component_weights = H_df.loc[top_component]
-        high_genes = component_weights[component_weights > 0].sort_values(ascending=False).index.tolist()
-        defining_genes_dict[cluster] = high_genes
-
-    for cluster in sorted(cluster_labels.unique()):
-        assoc_mut = best_assoc[best_assoc['Cluster'] == cluster]
-        top_mutation = assoc_mut.sort_values('p_value').head(1)['Mutation'].values if not assoc_mut.empty else [f"Cluster_{cluster}_placeholder"]
-        defining_genes = defining_genes_dict.get(cluster, [])
-        all_signatures.setdefault(method_name, {})[top_mutation[0]] = defining_genes
-
-    return all_signatures
-
-
-# ========================
-# Wrapper: Create Unsupervised Signatures
-# ========================
-
-def create_unsupervised_signatures(X, Y):
-    Y_norm = np.zeros(Y.shape)
-    s = Y.sum(axis=1)  # Total expression per sample
-    p = 10000 / s
-    Y_norm = np.log(Y.mul(p, axis=0) + 1)
-    ss = StandardScaler()
-    Y = pd.DataFrame(ss.fit_transform(Y_norm))
-    Y.columns = [f'Expression_Gene_{i}' for i in range(Y_norm.shape[1])]
-    us_signatures = {}
-    us_signatures.update(create_kmeans_nmf_signature(Y, X, method_name='NMF-KMeans', n_components=20))
-    us_signatures.update(create_signatures_kmeans(X, Y, method_name='K-means'))
-    return us_signatures
+    return out
 
 
 def every_signatures(d1, d2):
