@@ -262,43 +262,94 @@ def predicitve_check(func, factors, holdout_portion=0.2, n_rep=100):
     return(overall_pval)
     #print(f'Predictive check using {factors}: p-value {overall_pval}')  # Print the overall predictive check p-value
 
-def deconfounder(X, Y, alpha_range=np.arange(0.01, 1, 0.01), n_splits=3, n_repeats=3, random_state=1):
+
+def deconfounder(
+    X: pd.DataFrame,
+    Y: pd.DataFrame,
+    *,
+    # params mapped to your CD solver
+    a: float = 1.0,
+    e: float = 0.01,
+    Kfold: int = 10,
+    K: int = 100,
+    tol: float = 1e-4,
+    max_ite: int = 100,
+    seed: int = 42,
+):
     """
-    Run LassoCV and train Lasso on each gene in Y with cross-validation.
-    
-    Parameters:
-        X (pd.DataFrame): Feature matrix.
-        Y (pd.DataFrame): Target gene expression matrix.
-        alpha_range (np.ndarray): Grid of alpha values for LassoCV.
-        n_splits (int): Number of CV folds.
-        n_repeats (int): Number of CV repetitions.
-        random_state (int): Seed for reproducibility.
-    
+    Wrap the coordinate-descent multi-output Lasso to mimic the old LassoCV API.
+
     Returns:
-        pd.DataFrame: Coefficients (non-zero) for each target gene.
-        list: Trained Lasso models.
-        list: R² values per model.
+        coefs (pd.DataFrame): index=X.columns, cols=range(Y.shape[1]),
+                              only non-zero coefficients filled.
+        models (list): objects with .coef_, .predict(X), .score(X,y).
+        r2_scores (list): in-sample R^2 per target gene (like old impl).
     """
-    coefs = pd.DataFrame(index=X.columns)
-    models = []
-    r2_scores = []
+    # Ensure numeric numpy arrays
+    X_np = np.asarray(X.values, dtype=float)
+    Y_np = np.asarray(Y.values, dtype=float)
 
-    for i in range(Y.shape[1]):
-        y = Y.iloc[:, i]
-        cv = RepeatedKFold(n_splits=n_splits, n_repeats=n_repeats, random_state=random_state)
-        lassocv = LassoCV(alphas=alpha_range, cv=cv, random_state=random_state)
-        lassocv.fit(X, y)
+    n, p = X_np.shape
+    q = Y_np.shape[1]
 
-        model = Lasso(alpha=lassocv.alpha_)
-        model.fit(X, y)
+    # Means needed to reconstruct predictions in original (un-normalized) space
+    y_means = Y_np.mean(axis=0, keepdims=True)  # shape (1, q)
+
+    # Recompute X normalization to match your solver's preprocessing
+    # (must mirror: S = sqrt( sum(x^2)/n - mean(x)^2 ))
+    M = X_np.mean(axis=0, keepdims=True)  # (1, p)
+    S2 = (np.sum(X_np**2, axis=0, keepdims=True) / n) - (M**2)
+    # Guard against numerical zeros/negatives
+    S = np.sqrt(np.where(S2 <= 0.0, 1.0, S2))  # (1, p)
+
+    # Run your cross-validation to get the best coefficients per output
+    B_best, MSE, B_full = cross_validation(
+        X_np, Y_np,
+        a=a, e=e, Kfold=Kfold, K=K, tol=tol, max_ite=max_ite, seed=seed
+    )
+    # B_best: list length q, each entry is a (p,) vector (coeffs in normalized space)
+    B_mat = np.column_stack(B_best) if q > 1 else np.asarray(B_best).reshape(p, 1)  # (p, q)
+
+    # Build coef table like before: index = X.columns, columns = 0..q-1
+    coefs = pd.DataFrame(index=X.columns, columns=range(q), dtype=float)
+    for j in range(q):
+        nz_idx = np.flatnonzero(B_mat[:, j] != 0)
+        if nz_idx.size:
+            coefs.iloc[nz_idx, j] = B_mat[nz_idx, j]
+
+    # Lightweight model wrapper that knows how to predict/score in original space
+    class _CDModel:
+        def __init__(self, coef_vec, x_mean, x_std, y_mean_scalar):
+            self.coef_ = np.asarray(coef_vec, dtype=float).ravel()     # (p,)
+            self.M = np.asarray(x_mean, dtype=float).ravel()           # (p,)
+            self.S = np.asarray(x_std, dtype=float).ravel()            # (p,)
+            # Avoid divide-by-zero in case of zero-variance features
+            self.S[self.S == 0.0] = 1.0
+            self.y_mean_ = float(y_mean_scalar)
+            # For parity with scikit's API (no extra intercept in normalized fit)
+            self.intercept_ = self.y_mean_
+
+        def predict(self, X_in):
+            X_arr = np.asarray(X_in, dtype=float)
+            Xn = (X_arr - self.M) / self.S
+            return Xn @ self.coef_ + self.y_mean_
+
+        def score(self, X_in, y_true):
+            y_true = np.asarray(y_true, dtype=float).ravel()
+            y_pred = self.predict(X_in).ravel()
+            ss_res = np.sum((y_true - y_pred) ** 2)
+            ss_tot = np.sum((y_true - y_true.mean()) ** 2)
+            return 1.0 - ss_res / ss_tot if ss_tot > 0 else np.nan
+
+    # Create per-gene models and compute R^2 on the training data (like the old impl)
+    models, r2_scores = [], []
+    for j in range(q):
+        model = _CDModel(B_mat[:, j], M, S, y_means[0, j])
         models.append(model)
-
-        nz_idx = model.coef_.nonzero()[0]
-        nz_features = X.columns[nz_idx]
-        coefs.loc[nz_features, i] = model.coef_[nz_idx]
-        r2_scores.append(model.score(X, y))
+        r2_scores.append(model.score(X_np, Y_np[:, j]))
 
     return coefs, models, r2_scores
+
 
 def choose_latent_dim_ppca(X, k_range=range(2, 99), holdout_portion=0.2, pval_cutoff=0.1, seed=123
 ):
