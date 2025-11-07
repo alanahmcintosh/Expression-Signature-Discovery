@@ -232,6 +232,17 @@ def read_clinical_file(path: str) -> pd.DataFrame:
     raise ValueError(f"[read_clinical_file] Failed to load clinical file: {path}")
 
 
+def read_rna_file(path: str) -> pd.DataFrame:
+    """Try reading a clinical file with flexible delimiters."""
+    for sep_try in [None, "\t", ",", r"\s+"]:
+        try:
+            df = pd.read_csv(path, sep=sep_try, engine="python", header=0, index_col=0)
+            return df
+        except Exception:
+            continue
+    raise ValueError(f"[read_clinical_file] Failed to load clinical file: {path}")
+
+
 def process_subtypes(sample_info: pd.DataFrame, min_samples: int = 5) -> pd.DataFrame:
     """Extract and clean subtype column, filtering for sufficient sample counts."""
     if sample_info is None or sample_info.empty:
@@ -300,12 +311,14 @@ def integrate_data(
     mut_path: str,
     cna_path: str,
     fusion_info_path: Optional[str],
-    subtype_clinical_path: str,
+    patient_path: str,
+    sample_path: str,
+    rna_path: str, 
     study: Optional[str] = None,
     disease: Optional[str] = None,
     cna_process: bool = True,
-    cna_top_n: int = 500,
-    min_subtype_n: int = 5,
+    cna_top_n: int = 200,
+    min_subtype_n: int = 3,
     mut_freq_thresh: float = 0.02,
     fusion_freq_thresh: float = 0.02,
     is_tcga: bool = True,
@@ -315,9 +328,12 @@ def integrate_data(
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Integrate mutation, CNA, fusion, and clinical data into aligned matrices."""
     # --- 1. Clinical + subtype
-    clinical_start = read_clinical_file(subtype_clinical_path)
+    clinical_start = read_clinical_file(patient_path)
+    clinical_start = clinical_start.iloc[4:,]
     clinical = process_subtypes(clinical_start, min_samples=min_subtype_n)
     clinical = safe_map_index(clinical, study, "Clinical")
+    sample = read_clinical_file(sample_path)
+    sample = sample.iloc[4:,]
 
     # --- 2. Mutations
     if input_format == "onehot":
@@ -335,7 +351,7 @@ def integrate_data(
         mut_raw.index = to_patient_id(mut_raw.index.to_series(), study=study).str.strip().str.upper()
         mut_raw = _to_patient_index(mut_raw[mut_raw.index.notna()], study)
 
-    # --- 3. CNA & Fusions
+    # --- 3. CNA & Fusions & RNA
     cna_raw = load_cna(cna_path, cna_top_n, cna_process, rename)
     cna_raw = safe_map_index(cna_raw, study, "CNA")
 
@@ -348,8 +364,13 @@ def integrate_data(
     else:
         print("[INFO] No fusion file provided; skipping fusions.")
 
+    rna = read_rna_file(rna_path)
+    rna.index = to_patient_id(rna.index, study=study)
+    if rna.shape[0] > rna.shape[1]:
+        rna = rna.T
+
     # --- 4. Intersections
-    modalities = {"mut": mut_raw, "cna": cna_raw, "clin": clinical}
+    modalities = {"mut": mut_raw, "cna": cna_raw, "clin": clinical, 'RNA':rna}
     if fusion_raw is not None:
         modalities["fus"] = fusion_raw
 
@@ -378,6 +399,8 @@ def integrate_data(
     cna_df = np.power(2, cna_raw.loc[common]) if is_tcga else cna_raw.loc[common]
     clinical = clinical.loc[common]
     fusion_df = fusion_raw.loc[common] if fusion_raw is not None else pd.DataFrame(index=common)
+    rna_df = rna.loc[common]
+    clinical_df= pd.concat([clinical_start, sample], axis=1, join='inner')
 
     # --- 6. Frequency filters
     if mut_df.shape[0] < 100:
@@ -397,5 +420,5 @@ def integrate_data(
             print("[WARN] No fusions passed frequency filter.")
             fusion_df = pd.DataFrame(index=common)
 
-    return mut_df, cna_df, fusion_df, clinical
+    return mut_df, cna_df, fusion_df, clinical, clinical_df, rna_df
 
