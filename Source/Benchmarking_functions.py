@@ -32,98 +32,12 @@ from pydeseq2.ds import DeseqStats
 from pydeseq2.default_inference import DefaultInference
 
 # Custom functions
-from Deconfounder import ppca, predicitve_check
+from Deconfounder import precompute_global_results
 
 # Typing
 from typing import Dict, Tuple, List, Optional
 
 
-# ========================
-# Supervised Methods
-# ========================
-def deconfounder(X, Y, alpha_range=np.arange(0.01, 1, 0.01), n_splits=3, n_repeats=3, random_state=1):
-    """
-    Run LassoCV and train Lasso on each gene in Y with cross-validation.
-    
-    Parameters:
-        X (pd.DataFrame): Feature matrix.
-        Y (pd.DataFrame): Target gene expression matrix.
-        alpha_range (np.ndarray): Grid of alpha values for LassoCV.
-        n_splits (int): Number of CV folds.
-        n_repeats (int): Number of CV repetitions.
-        random_state (int): Seed for reproducibility.
-    
-    Returns:
-        pd.DataFrame: Coefficients (non-zero) for each target gene.
-        list: Trained Lasso models.
-        list: R² values per model.
-    """
-    coefs = pd.DataFrame(index=X.columns)
-    models = []
-    r2_scores = []
-
-    for i in range(Y.shape[1]):
-        y = Y.iloc[:, i]
-        cv = RepeatedKFold(n_splits=n_splits, n_repeats=n_repeats, random_state=random_state)
-        lassocv = LassoCV(alphas=alpha_range, cv=cv, random_state=random_state)
-        lassocv.fit(X, y)
-
-        model = Lasso(alpha=lassocv.alpha_)
-        model.fit(X, y)
-        models.append(model)
-
-        nz_idx = model.coef_.nonzero()[0]
-        nz_features = X.columns[nz_idx]
-        coefs.loc[nz_features, i] = model.coef_[nz_idx]
-        r2_scores.append(model.score(X, y))
-
-    return coefs, models, r2_scores
-
-def choose_latent_dim_ppca(X, k_range=range(2, 99), holdout_portion=0.2, pval_cutoff=0.1, seed=123
-):
-    for k in k_range:
-        model = ppca(factors=k)
-        model.holdout(X, holdout_portion=holdout_portion, seed=seed)
-        model.max_likelihood(model.x_train, standardise=False)
-        pval = predicitve_check(model, k, holdout_portion=holdout_portion)
-        
-        if pval >= pval_cutoff:
-            return k  # first valid k found
-    
-    # If none satisfy the cutoff, return max tested value
-    return k_range[-1]
-
-def precompute_global_results(X, Y):
-    """
-    Run the full Deconfounder pipeline on input matrices X and Y.
-    Adds inferred latent variables, normalizes expression, runs Lasso, and returns signatures.
-    """
-    k = choose_latent_dim_ppca(X)
-    print(f"Selected latent dimension: {k}")
-    print("Precomputing Deconfounder...")
-
-    m_ppca = ppca(k)
-    m_ppca.holdout(X, seed=44)
-    m_ppca.max_likelihood(m_ppca.x_train, standardise=False)
-    _ = m_ppca.generate(1)
-    _ = predicitve_check(m_ppca, k)
-
-    latent_df = pd.DataFrame(m_ppca.z_mu.T, index=X.index, columns=[f"latent_{i}" for i in range(k)])
-    augmented_X = pd.concat([X, latent_df], axis=1).astype(float)
-    augmented_X.columns = augmented_X.columns.astype(str)
-
-    # Normalize gene expression using library size normalization + log transform
-    size_factors = 10000 / Y.sum(axis=1)
-    Y_norm = np.log1p(Y.mul(size_factors, axis=0))
-    Y_scaled = pd.DataFrame(StandardScaler().fit_transform(Y_norm), index=Y.index)
-    Y_scaled.columns = [f'Expression_Gene_{i}' for i in range(Y.shape[1])]
-    causal_signatures = {}
-    coefs, models, R2 = deconfounder(augmented_X, Y_scaled)
-    coefs_tr = coefs.T.set_index(Y.columns)
-    causal_signatures['Deconfounder'] = coefs_tr
-
-    print("Global precomputation completed.")
-    return causal_signatures
 
 # ========================
 # Logistic Regression Methods
@@ -646,6 +560,12 @@ def run_tcga_style_ov_pipeline(
         out["K-means"] = signatures_km
 
     return out
+
+
+def every_signatures(d1, d2):
+    d1.update(d2)
+    return d1
+
 
 
 def every_signatures(d1, d2):
