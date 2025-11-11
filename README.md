@@ -1,4 +1,4 @@
-# OncoSigBench
+# Benchmarking Methods for Expression SIgnature Discovery
 
 OncoSigBench is a benchmarking framework for evaluating methods that derive gene expression signatures associated with genetic alterations (mutations, CNAs, fusions). 
 
