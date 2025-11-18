@@ -24,7 +24,7 @@ from sklearn.neighbors import NearestNeighbors
 # PART 1 — PREPROCESSING + ALTERATION SIMULATION
 # ==============================================================
 
-def preprocess_X_weighted(mut=None, fusion=None, cna=None, clinical=None, weights=None):
+def preprocess_X_weighted(mut=None, fusion=None, cna=None, clinical=None, weights={'mut': 1.0, 'fusion': 1.5, 'cna': 1.0, 'clinical': 0.5}):
     """
     Standardizes and weights alteration data blocks before KNN sampling.
 
@@ -42,7 +42,7 @@ def preprocess_X_weighted(mut=None, fusion=None, cna=None, clinical=None, weight
     unscaled_blocks : dict
         Original unscaled blocks (used for downstream resampling).
     """
-    weights = weights or {'mut': 1.0, 'fusion': 1.5, 'cna': 1.0, 'clinical': 0.5}
+    weights = weights
     scaler = StandardScaler()
     scaled_blocks, unscaled_blocks = [], {}
 
@@ -139,7 +139,7 @@ def sample_from_neighbors_ratioCNA(
                 val = np.random.lognormal(mean=mu, sigma=sigma)
 
                 # Clamp to realistic CNA range
-                synthetic[col] = np.clip(val, 0.2, 3.5)
+                #synthetic[col] = np.clip(val, 0.2, 3.5)
 
             # --- CLINICAL ---
             elif col in unscaled_dfs.get('clinical', {}):
@@ -155,15 +155,14 @@ def sample_from_neighbors_ratioCNA(
 
 def simulate_X_hybrid_ratioCNA(
     mut, fusion, cna, clinical, subtype, n_samples,
-    weights=None, k_neighbors=5, seed=44
+    weights={'mut': 1.0, 'fusion': 1.5, 'cna': 1.0, 'clinical': 0.5} , k_neighbors=5, seed=44
 ):
     """
     Subtype-aware hybrid simulator for mutations, fusions, CNAs, and clinical data.
     Each subtype is simulated independently to preserve within-subtype structure.
     """
     np.random.seed(seed)
-    weights = weights or {'mut': 1.0, 'fusion': 1.5, 'cna': 1.0, 'clinical': 0.5}
-
+    weights = weights 
     # Determine how many samples to simulate per subtype (proportional to real subtype distribution)
     subtype_counts = subtype['Subtype'].value_counts()
     proportions = subtype_counts / subtype_counts.sum()
