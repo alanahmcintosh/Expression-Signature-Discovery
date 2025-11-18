@@ -1,10 +1,3 @@
-# ==============================================================
-# PART 2 — RNA SIMULATION PIPELINE
-# ==============================================================
-# The goal is to simulate RNA-seq counts driven by alterations,
-# preserving realistic structure (dispersion, correlation, subtype).
-# ==============================================================
-
 import numpy as np
 import pandas as pd
 import random
@@ -18,7 +11,7 @@ from pydeseq2.dds import DeseqDataSet  # or your wrapper import
 # 1️⃣  DESeq2-LIKE PARAMETER ESTIMATION
 # ==============================================================
 
-def estimate_deseq2_parameters(rna_df, size_factor_sd=0.2, seed=None, condition='A'):
+def estimate_deseq2_parameters(rna_df, size_factor_sd=0.2, seed=44, condition='A'):
     """
     Estimate DESeq2-style parameters (mean, dispersion, and size factors)
     from a real RNA count matrix.
@@ -81,14 +74,14 @@ def estimate_deseq2_parameters(rna_df, size_factor_sd=0.2, seed=None, condition=
 # 2️⃣  SIZE FACTOR RESAMPLING (SUBTYPE-AWARE)
 # ==============================================================
 
-def draw_size_factors_from_deseq(size_factors, n_samples, subtype=None, rng=None):
+def draw_size_factors_from_deseq(size_factors, n_samples, subtype=None, seed=44):
     """
     Resample DESeq2 size factors (sample-level normalization coefficients)
     to assign realistic per-sample scaling in the simulated data.
 
     Optionally stratified by subtype proportions.
     """
-    rng = np.random.default_rng(rng)
+    rng = np.random.default_rng(seed)
     sf = size_factors.dropna()
 
     # No subtypes: resample directly
@@ -115,67 +108,105 @@ def draw_size_factors_from_deseq(size_factors, n_samples, subtype=None, rng=None
 # 3️⃣  PCA + KNN MIXING: RNA BACKGROUND GENERATOR
 # ==============================================================
 
-def _knn_mix_block_pca(real_block, n_samples, n_pcs=30, k=30,
+def knn_mix_block_pca(real_block, n_samples, n_pcs=30, k=30,
                        mix_conc=1.0, residual_scale=0.5,
                        seed=44, metric="euclidean"):
     """
-    Generate new RNA mean profiles (μ) by mixing local neighbors
-    in PCA space — preserves gene–gene correlation structure.
+    Generate synthetic RNA mean expression profiles (μ) by mixing
+    nearest neighbours in PCA space.
 
-    Steps:
-      1. Log-transform and z-score normalize.
-      2. Run PCA to capture dominant variance.
-      3. For each synthetic sample:
-         - pick a random sample as anchor
-         - find k nearest neighbors in PCA space
-         - mix neighbors with Dirichlet weights
-         - optionally add scaled residual noise
+    This preserves the overall correlation structure of real data
+    while allowing unlimited new samples.
+
+    Procedure:
+      1. log1p-transform and z-score the real data
+      2. run PCA to capture major gene–gene structure
+      3. for each synthetic sample:
+         - select a random "anchor" sample
+         - find its k nearest neighbors in PCA space
+         - mix neighbors using Dirichlet weights (controls diversity)
+         - optionally add scaled residual noise (fine-grained variation)
+         - transform back to original expression scale
     """
+
+    # Random number generator for reproducibility
     rng = np.random.default_rng(seed)
-    R = real_block.clip(lower=0)
-    L = np.log1p(R)
 
-    # Standardize across genes
+    # -----------------------------------------
+    # 1. Log-transform input
+    # -----------------------------------------
+    R = real_block.clip(lower=0)      # ensure no negatives
+    L = np.log1p(R)                   # log1p stabilizes variance
+
+    # -----------------------------------------
+    # 2. Z-score normalization (gene-wise)
+    # -----------------------------------------
     mu = L.mean(axis=0)
-    sd = L.std(axis=0, ddof=0).replace(0, 1.0)
-    Z = (L - mu) / sd
+    sd = L.std(axis=0, ddof=0).replace(0, 1.0)  # avoid division by zero
+    Z = (L - mu) / sd                           # standardized matrix
 
-    # PCA to capture gene structure
-    n_comp = max(2, min(n_pcs, Z.shape[0]-1, Z.shape[1]))
+    # -----------------------------------------
+    # 3. PCA: capture major structure (dimension reduction)
+    # -----------------------------------------
+    # Limit PCs to something meaningful (can't exceed n_samples or n_genes)
+    n_comp = max(2, min(n_pcs, Z.shape[0] - 1, Z.shape[1]))
     pca = PCA(n_components=n_comp, random_state=0).fit(Z)
-    S = pca.transform(Z)
-    Z_recon = pca.inverse_transform(S)
-    Z_resid = Z - Z_recon  # residuals (fine-grained variance)
 
-    k_ = max(2, min(k, len(S)))
+    S = pca.transform(Z)              # samples in PC space
+    Z_recon = pca.inverse_transform(S)
+    Z_resid = Z - Z_recon             # residuals = fine-scale variation
+
+    # -----------------------------------------
+    # 4. KNN model in PCA space
+    # -----------------------------------------
+    k_ = max(2, min(k, len(S)))       # ensure k is valid
     nn = NearestNeighbors(n_neighbors=k_, metric=metric).fit(S)
 
     mixes = []
+
+    # -----------------------------------------
+    # 5. Generate synthetic samples
+    # -----------------------------------------
     for i in range(n_samples):
-        # Pick anchor and its neighborhood
+
+        # Choose anchor sample
         a = int(rng.integers(0, len(S)))
+
+        # Get its k nearest neighbors in PC space
         _, idxs = nn.kneighbors(S[a:a+1])
         nbrS = S[idxs[0]]
 
-        # Mix neighbors with Dirichlet weights
+        # -----------------------------------------
+        # Mix neighbors using Dirichlet weights
+        # mix_conc controls how "spread out" the mixture is:
+        #   - low conc => more diverse, sharp mixtures
+        #   - high conc => neighbors weighted more evenly
+        # -----------------------------------------
         w = rng.dirichlet(np.full(nbrS.shape[0], mix_conc))
         s_mix = np.average(nbrS, axis=0, weights=w)
 
-        # Reconstruct expression vector
+        # Back-project from PCA space to standardized gene space
         z_mix = pca.inverse_transform(s_mix)
 
-        # Add scaled residual noise (local variation)
+        # -----------------------------------------
+        # Add local fine-grained variation
+        # (residuals represent structure not captured by PCA)
+        # -----------------------------------------
         if residual_scale and residual_scale > 0:
-            j = int(rng.choice(idxs[0]))
+            j = int(rng.choice(idxs[0]))     # pick one of the neighbors
             z_mix = z_mix + residual_scale * Z_resid.iloc[j].values
 
-        # Revert to original expression scale
+        # -----------------------------------------
+        # 6. Transform back to original expression scale
+        # -----------------------------------------
         mu_expr = np.expm1(z_mix * sd.values + mu.values)
-        mu_expr[mu_expr < 0] = 0.0
+        mu_expr[mu_expr < 0] = 0.0           # numerical protection
         mixes.append(mu_expr)
 
+    # Final synthetic μ matrix
     sim_mu = pd.DataFrame(mixes, columns=real_block.columns)
     return sim_mu
+
 
 
 def simulate_background_knn(real_rna, n_samples, n_pcs=30, k=30,
@@ -183,44 +214,85 @@ def simulate_background_knn(real_rna, n_samples, n_pcs=30, k=30,
                             subtype=None, size_factors_to_apply=None,
                             metric="euclidean"):
     """
-    High-level function for generating background RNA mean expression (μ)
-    while preserving subtype proportions and applying DESeq2-style size factors.
+    Generate background RNA mean expression (μ) using KNN–PCA mixing.
+
+    If subtype labels are provided, the simulation preserves subtype 
+    proportions and generates expression separately within each subtype.
+
+    Optionally apply DESeq2-style size factors afterward.
     """
-    # No subtype stratification → single PCA block
+
+    # ------------------------------------------------------
+    # Case 1: No subtype structure — simulate from entire dataset
+    # ------------------------------------------------------
     if subtype is None:
-        sim_mu = _knn_mix_block_pca(
-            real_block=real_rna, n_samples=n_samples,
-            n_pcs=n_pcs, k=k, mix_conc=mix_conc,
-            residual_scale=residual_scale, seed=seed, metric=metric
+        sim_mu = knn_mix_block_pca(
+            real_block=real_rna,
+            n_samples=n_samples,
+            n_pcs=n_pcs,
+            k=k,
+            mix_conc=mix_conc,
+            residual_scale=residual_scale,
+            seed=seed,
+            metric=metric
         )
+
+    # ------------------------------------------------------
+    # Case 2: Subtype-aware simulation
+    # - simulate each subtype separately
+    # - keep subtype proportions in the synthetic dataset
+    # ------------------------------------------------------
     else:
-        # Split by subtype to preserve within-subtype expression structure
-        subtype = subtype.loc[real_rna.index]
+        subtype = subtype.loc[real_rna.index]  # align labels
         counts = subtype.value_counts()
         props = counts / counts.sum()
+
+        # Allocate number of synthetic samples per subtype
         alloc = (props * n_samples).round().astype(int)
-        alloc.iloc[-1] += n_samples - alloc.sum()
+        alloc.iloc[-1] += n_samples - alloc.sum()  # fix rounding
 
         parts = []
+
+        # Simulate each subtype independently
         for i, (s, n) in enumerate(alloc.items()):
             block = real_rna.loc[subtype[subtype == s].index]
-            part = _knn_mix_block_pca(
-                real_block=block, n_samples=int(n),
-                n_pcs=n_pcs, k=k, mix_conc=mix_conc,
+
+            # Use different seeds for each subtype block
+            # so they don’t produce identical samples
+            block_seed = seed + i if seed is not None else None
+
+            part = knn_mix_block_pca(
+                real_block=block,
+                n_samples=int(n),
+                n_pcs=n_pcs,
+                k=k,
+                mix_conc=mix_conc,
                 residual_scale=residual_scale,
-                seed=(seed + i if seed else None),
+                seed=block_seed,
                 metric=metric
             )
             parts.append(part)
+
+        # Combine subtype-specific simulations into one dataframe
         sim_mu = pd.concat(parts, axis=0)
 
-    # Apply simulated DESeq2 size factors
+    # ------------------------------------------------------
+    # Final formatting + apply size factors
+    # ------------------------------------------------------
+
+    # Give synthetic samples clean names
     sim_mu.index = [f"Sample_{i+1}" for i in range(n_samples)]
+
+    # Apply provided DESeq2 size factors (optional)
     if size_factors_to_apply is not None:
         if len(size_factors_to_apply) != n_samples:
             raise ValueError("size_factors_to_apply length mismatch.")
+
+        # Multiply rows by their corresponding size factor
         sim_mu = sim_mu.mul(size_factors_to_apply, axis=0)
+
     return sim_mu
+
 
 
 # ==============================================================
@@ -238,14 +310,17 @@ def generate_signatures_simplified(
     fusion_range=(-2.0, +2.0)
 ):
     """
-    Create synthetic expression signatures for each alteration.
+    Generate synthetic expression signatures for each alteration based on
+    simplified biological rules.
 
     Rules:
-      - GOF and CNA gains → similar upregulated signature
-      - LOF and CNA losses → similar downregulated signature
-      - MUT (uncertain) → no signature
-      - Fusions → unique mixed-direction signature
+      - GOF mutations & CNA gains → upregulated signatures
+      - LOF mutations & CNA losses → downregulated signatures
+      - MUT / uncertain → no signature
+      - Fusions → unique mixed-direction signatures
     """
+
+    # Set global random seeds for reproducibility
     if seed is not None:
         np.random.seed(seed)
         random.seed(seed)
@@ -254,38 +329,70 @@ def generate_signatures_simplified(
     gene_set = set(genes)
 
     for alt in alteration_features:
-        kind, base_gene, partners = _parse_alt(alt)  # assumes you have a parser elsewhere
 
-        # Skip uncertain/passenger mutations
+        # Parse alteration name → type, gene, partners (for fusions)
+        kind, base_gene, partners = _parse_alt(alt)
+
+        # ------------------------------------------------------
+        # 1. Skip uncertain/passenger mutations entirely
+        # ------------------------------------------------------
         if kind == "UNCERTAIN":
             continue
 
-        # --- Fusions ---
+        # ------------------------------------------------------
+        # 2. Fusions have their own signature logic
+        # ------------------------------------------------------
         if kind == "FUSION":
+            # Keep only fusion partner genes that exist in the gene list
             fusion_targets = [g for g in (partners or []) if g in gene_set]
+
+            # If none of the partners are in the expression matrix, skip
             if not fusion_targets:
                 continue
+
+            # Choose signature size
             n_targets = random.randint(min_size, max_size)
+
+            # Add remaining targets from other available genes
             remaining = [g for g in genes if g not in fusion_targets]
-            targets = fusion_targets + random.sample(remaining, k=max(0, n_targets - len(fusion_targets)))
-            effects = {t: np.round(np.random.uniform(*fusion_range), 2) for t in targets}
+            extra = random.sample(remaining, k=max(0, n_targets - len(fusion_targets)))
+
+            targets = fusion_targets + extra
+
+            # Fusions get mixed-direction effects (can be + or -)
+            effects = {
+                t: float(np.round(np.random.uniform(*fusion_range), 2))
+                for t in targets
+            }
+
             signatures[alt] = {"targets": targets, "effects": effects}
             continue
 
-        # --- GOF / LOF / CNA ---
+        # ------------------------------------------------------
+        # 3. GOF / LOF mutations and CNA changes
+        # ------------------------------------------------------
+        # Skip if the gene isn’t in the expression dataset
         if base_gene not in gene_set:
             continue
 
+        # Determine signature size
         n_targets = random.randint(min_size, max_size)
+
+        # Avoid sampling the base gene twice
         pool = [g for g in genes if g != base_gene]
+
+        # Signature always includes the gene itself
         targets = [base_gene] + random.sample(pool, k=n_targets - 1)
 
-        # Select effect direction
+        # ------------------------------------------------------
+        # Choose effect direction based on alteration type
+        # ------------------------------------------------------
         if kind == "GOF":
             rng = gof_range
         elif kind == "LOF":
             rng = lof_range
         elif kind.endswith("_CNA"):
+            # Interpret CNA as GOF-like or LOF-like
             if "gain" in alt.lower() or "amp" in alt.lower():
                 rng = gof_range
             elif "loss" in alt.lower() or "del" in alt.lower():
@@ -295,18 +402,31 @@ def generate_signatures_simplified(
         else:
             rng = (-1, 1)
 
-        effects = {t: float(np.round(np.random.uniform(*rng), 2)) for t in targets}
+        # Draw per-gene effects
+        effects = {
+            t: float(np.round(np.random.uniform(*rng), 2))
+            for t in targets
+        }
 
-        # Strengthen self-effect (biologically realistic)
+        # ------------------------------------------------------
+        # Strengthen the effect on the altered gene itself
+        # ------------------------------------------------------
         if base_gene in effects:
             if rng == gof_range:
-                effects[base_gene] = float(np.round(np.random.uniform(1.2, gof_range[1]), 2))
+                # Make self-effect strongly upregulated
+                effects[base_gene] = float(
+                    np.round(np.random.uniform(1.2, gof_range[1]), 2)
+                )
             elif rng == lof_range:
-                effects[base_gene] = float(np.round(np.random.uniform(lof_range[0], -1.2), 2))
+                # Make self-effect strongly downregulated
+                effects[base_gene] = float(
+                    np.round(np.random.uniform(lof_range[0], -1.2), 2)
+                )
 
         signatures[alt] = {"targets": targets, "effects": effects}
 
     return signatures
+
 
 
 def log2_to_ratio(cna_log2: pd.DataFrame) -> pd.DataFrame:
@@ -314,7 +434,6 @@ def log2_to_ratio(cna_log2: pd.DataFrame) -> pd.DataFrame:
     cna_ratio = np.power(2, cna_log2)
     cna_ratio = cna_ratio.replace([np.inf, -np.inf], np.nan).fillna(1.0)
     return cna_ratio
-
 
 def inject_expression_effects_simplified(
     expr_df: pd.DataFrame,
@@ -324,54 +443,80 @@ def inject_expression_effects_simplified(
     floor_zero: bool = True
 ):
     """
-    Inject additive alteration-driven expression effects into the simulated background.
+    Add alteration-driven expression effects onto a background RNA matrix.
 
-    Notes:
-      - GOF + CNA gain reinforce positive expression changes.
-      - LOF + CNA loss reinforce negative effects.
-      - Effect magnitude scales with CNA ratio (copy number level).
+    Effects are additive:
+      - Each alteration contributes its own signature.
+      - CNA values modulate the strength of the effect.
+      - GOF + CNA gain amplify upregulation.
+      - LOF + CNA loss amplify downregulation.
+
+    If floor_zero=True, negative values are clipped to 0.
     """
+
     modified = expr_df.copy()
 
-    # Transform CNA to ratio space if log2 encoded
+    # ------------------------------------------------------
+    # 1. Convert CNA to ratio-scale if it looks log2-like
+    #    (typical log2 CNA values rarely exceed ±3)
+    # ------------------------------------------------------
     if cna_df is not None and cna_df.max().max() < 3:
         cna_ratio = log2_to_ratio(cna_df)
     else:
         cna_ratio = cna_df.copy() if cna_df is not None else None
 
+    # ------------------------------------------------------
+    # 2. Process each sample independently
+    # ------------------------------------------------------
     for sample in expr_df.index:
-        # Get all active alterations for that sample
+
+        # Identify all alterations active in this sample
         active_alts = [
             alt for alt in alteration_df.columns
             if alteration_df.loc[sample, alt] == 1 and alt in signatures
         ]
 
-        # Apply expression effects per alteration
+        # ------------------------------------------------------
+        # 3. Inject expression effects for each alteration
+        # ------------------------------------------------------
         for alt in active_alts:
             sig = signatures[alt]
             kind, base_gene, partners = _parse_alt(alt)
+
+            # Loop over all target genes in the signature
             for tgt, eff in sig["effects"].items():
                 if tgt not in modified.columns:
                     continue
 
-                total_effect = eff
+                total_effect = eff  # begin with signature effect
 
-                # Modulate by CNA copy number
+                # ------------------------------------------------------
+                # 4. Modulate effect by CNA for the base gene (if available)
+                # ------------------------------------------------------
                 if cna_ratio is not None and base_gene in cna_ratio.columns:
                     cna_val = cna_ratio.loc[sample, base_gene]
+
                     if not np.isnan(cna_val):
+                        # Base scaling proportional to copy number level
                         total_effect *= cna_val
+
+                        # Reinforcement for consistent alteration + CNA direction
                         if kind == "GOF" and cna_val > 1:
                             total_effect += eff * (cna_val - 1)
                         elif kind == "LOF" and cna_val < 1:
                             total_effect += eff * (1 - cna_val)
 
+                # Apply effect to the sample × gene entry
                 modified.at[sample, tgt] += total_effect
 
+    # ------------------------------------------------------
+    # 5. Ensure values don’t drop below zero
+    # ------------------------------------------------------
     if floor_zero:
         modified[modified < 0] = 0.0
 
     return modified
+
 
 def simulate_rna_with_signatures(
     rna_df,
