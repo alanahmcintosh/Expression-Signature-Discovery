@@ -1,19 +1,4 @@
 
-"""
-==============================================================
-SIMULATION PIPELINE
-==============================================================
-
-This module simulates:
-  1. Multi-omic alteration matrices (mutations, fusions, CNAs, clinical)
-     using subtype-stratified KNN + ratio-based CNA modeling.
-  2. RNA-seq expression data based on those alterations, using
-     DESeq2-style negative binomial parameterization and
-     alteration-driven expression effects.
-
-Developed for benchmarking gene-expression signature discovery methods.
-==============================================================
-"""
 
 import numpy as np
 import pandas as pd
