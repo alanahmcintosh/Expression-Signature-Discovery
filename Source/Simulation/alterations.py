@@ -415,3 +415,56 @@ def simulate_X_hybrid_ratioCNA(
     X_sim = pd.concat(blocks, axis=0)
     X_sim.index = [f"Sample_{i+1}" for i in range(len(X_sim))]
     return X_sim
+
+
+def split_simulated_blocks_v2(X_sim):
+    """
+    Splits a combined simulated matrix into separate dataframes for each omic block.
+
+    Assumes:
+      - Mutations end with _MUT/_GOF/_LOF
+      - Fusions contain _FUSION or _FUS
+      - CNA GISTIC calls end with _CNA
+      - Optional derived CNA views might end with _AMP/_DEL/_AMP_LVL/_DEL_LVL
+      - Subtype column might be "Subtype" or "SUBTYPE"
+    """
+    X_sim = X_sim.copy()
+    X_sim.columns = X_sim.columns.astype(str)
+
+    mut_cols = [c for c in X_sim.columns if c.endswith(("_MUT", "_GOF", "_LOF"))]
+    fusion_cols = [c for c in X_sim.columns if ("_FUSION" in c or "_FUS" in c)]
+
+    # Keep CNA as GISTIC calls by default, but allow derived views if present
+    cna_cols = [
+        c for c in X_sim.columns
+        if c.endswith(("_CNA", "_AMP", "_DEL", "_AMP_LVL", "_DEL_LVL"))
+    ]
+
+    # Subtype col detection (handles your current simulator output)
+    subtype_col = None
+    for cand in ("Subtype", "SUBTYPE", "subtype"):
+        if cand in X_sim.columns:
+            subtype_col = cand
+            break
+
+    exclude = set(mut_cols + fusion_cols + cna_cols + ([subtype_col] if subtype_col else []))
+    clinical_cols = [c for c in X_sim.columns if c not in exclude]
+
+    mut_sim = X_sim[mut_cols] if mut_cols else pd.DataFrame(index=X_sim.index)
+    fusion_sim = X_sim[fusion_cols] if fusion_cols else pd.DataFrame(index=X_sim.index)
+    cna_sim = X_sim[cna_cols] if cna_cols else pd.DataFrame(index=X_sim.index)
+    clin_sim = X_sim[clinical_cols] if clinical_cols else pd.DataFrame(index=X_sim.index, dtype="object")
+
+    if subtype_col:
+        subtype_sim = X_sim[subtype_col]
+    else:
+        subtype_sim = pd.Series(index=X_sim.index, dtype="object")
+
+    print(f" Mutations: {mut_sim.shape[1]} features")
+    print(f" Fusions:   {fusion_sim.shape[1]} features")
+    print(f" CNAs:      {cna_sim.shape[1]} features")
+    print(f" Clinical:  {clin_sim.shape[1]} features")
+    if subtype_col:
+        print(f" Subtypes:  {subtype_sim.nunique()} unique")
+
+    return mut_sim, fusion_sim, cna_sim, clin_sim, subtype_sim
