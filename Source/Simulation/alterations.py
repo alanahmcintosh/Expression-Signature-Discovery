@@ -153,8 +153,8 @@ def preprocess_X_weighted(
         amp_lvl = g.where(g > 0, 0).astype(float)            # 0,1,2
         del_lvl = (-g.where(g < 0, 0)).astype(float)         # 0,1,2
 
-        amp_scaled = robust_scale_with_floor(amp_lvl)
-        del_scaled = robust_scale_with_floor(del_lvl)
+        amp_scaled = robust_scale_with_floor(amp_lvl, cna_std_floor=cna_std_floor)
+        del_scaled = robust_scale_with_floor(del_lvl, cna_std_floor=cna_std_floor)
 
         # Rename so both views can coexist
         amp_scaled.columns = [f"{c}__AMP_LVL" for c in amp_scaled.columns]
