@@ -14,6 +14,8 @@ This script handles:
 import pandas as pd
 import numpy as np
 from typing import Optional
+from sklearn.preprocessing import StandardScaler
+import re
 
 # ============================================================
 # 1. Default Gene Sets
@@ -177,7 +179,7 @@ def maf_to_onehot(
 # 5. CNA / Fusion / Clinical Loaders
 # ============================================================
 
-def load_cna(path: str, top_n: int = 500, cna_process: bool = True, rename: bool = True) -> pd.DataFrame:
+def load_cna(path: str, cna_process=True, rename: bool = False) -> pd.DataFrame:
     """Load and preprocess a CNA file (TCGA-style)."""
     df = pd.read_csv(path, sep=None, engine="python", index_col=0)
     if cna_process:
@@ -187,8 +189,7 @@ def load_cna(path: str, top_n: int = 500, cna_process: bool = True, rename: bool
     if rename:
         df.columns = [f"{g}_CNA" for g in df.columns]
 
-    top_vars = df.var().sort_values(ascending=False).head(top_n).index
-    return df[top_vars]
+    return df
 
 
 def load_fusions_raw(path: str) -> pd.DataFrame:
@@ -317,22 +318,22 @@ def integrate_data(
     study: Optional[str] = None,
     disease: Optional[str] = None,
     cna_process: bool = True,
+    is_tcga=False,
     cna_top_n: int = 200,
     min_subtype_n: int = 3,
     mut_freq_thresh: float = 0.02,
     fusion_freq_thresh: float = 0.02,
-    is_tcga: bool = True,
     rename: bool = True,
     input_format: str = "maf",  # "maf" | "custom_tsv" | "onehot"
     uncertain_top_k: Optional[int] = 100,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Integrate mutation, CNA, fusion, and clinical data into aligned matrices."""
     # --- 1. Clinical + subtype
-    clinical_start = read_clinical_file(patient_path)
+    clinical_start = read_clinical_file(sample_path)
     clinical_start = clinical_start.iloc[4:,]
     clinical = process_subtypes(clinical_start, min_samples=min_subtype_n)
     clinical = safe_map_index(clinical, study, "Clinical")
-    sample = read_clinical_file(sample_path)
+    sample = read_clinical_file(patient_path)
     sample = sample.iloc[4:,]
 
     # --- 2. Mutations
@@ -352,7 +353,7 @@ def integrate_data(
         mut_raw = _to_patient_index(mut_raw[mut_raw.index.notna()], study)
 
     # --- 3. CNA & Fusions & RNA
-    cna_raw = load_cna(cna_path, cna_top_n, cna_process, rename)
+    cna_raw = load_cna(cna_path, cna_process, rename)
     cna_raw = safe_map_index(cna_raw, study, "CNA")
 
     fusion_raw = load_fusions_raw(fusion_info_path) if fusion_info_path else None
@@ -396,15 +397,25 @@ def integrate_data(
 
     # --- 5. Subset & normalize
     mut_df = mut_raw.loc[common]
-    cna_df = np.power(2, cna_raw.loc[common]) if is_tcga else cna_raw.loc[common]
+    cna_sub = cna_raw.loc[common]
+    cna_df = cna_sub.apply(pd.to_numeric, errors="coerce").fillna(0)
+    cna_df = np.rint(cna_df).astype(int).clip(-2, 2)
+    cna_neutral = 0
+
     clinical = clinical.loc[common]
     fusion_df = fusion_raw.loc[common] if fusion_raw is not None else pd.DataFrame(index=common)
     rna_df = rna.loc[common]
     clinical_df= pd.concat([clinical_start, sample], axis=1, join='inner')
 
     # --- 6. Frequency filters
+    if cna_top_n is not None and cna_top_n > 0:
+        # integer CN, assume diploid = 2
+        alt_freq = (cna_df != cna_neutral).mean(axis=0)  # fraction of samples altered (up or down)
+        top_genes = alt_freq.sort_values(ascending=False).head(cna_top_n).index
+        cna_df = cna_df[top_genes]
+
     if mut_df.shape[0] < 100:
-        mut_df = mut_df.loc[:, (mut_df > 0).sum() >= 5]
+        mut_df = mut_df.loc[:, (mut_df > 0).sum() >= 3]
     else:
         mut_df = mut_df.loc[:, (mut_df > 0).mean() >= mut_freq_thresh]
         top_300 = (mut_df > 0).mean().sort_values(ascending=False).head(300).index
@@ -412,7 +423,7 @@ def integrate_data(
 
     if _nonempty(fusion_df):
         if fusion_df.shape[0] < 100:
-            fusion_df = fusion_df.loc[:, (fusion_df > 0).sum() >= 5]
+            fusion_df = fusion_df.loc[:, (fusion_df > 0).sum() >= 3]
         else:
             freq = (fusion_df > 0).mean()
             fusion_df = fusion_df.loc[:, freq[freq >= fusion_freq_thresh].index]
@@ -423,6 +434,166 @@ def integrate_data(
     return mut_df, cna_df, fusion_df, clinical, clinical_df, rna_df
 
 
+
+
+# ============================================================
+# 8. Clinical Feature Selection
+# ============================================================
+
+
+CLIN_FEATURES = {
+    "AML": [
+        "SUBTYPE", "TCGA_PANCANATLAS_CANCER_TYPE_ACRONYM",
+        "DIAGNOSIS_AGE", "SEX", "RACE_CATEGORY", "ETHNICITY_CATEGORY",
+        "TMB_(NONSYNONYMOUS)", "ANEUPLOIDY_SCORE", "TUMOR_BREAK_LOAD",
+        "NEOPLASM_HISTOLOGIC_GRADE", "SAMPLE_TYPE"
+    ],
+    "ALL": [
+        "Cancer Subtype Curated",
+        "Cancer Type Detailed",
+        "Oncotree Code",
+        "Site of Sample",
+        "Sex",
+        "Reported Ethnicity",
+        "Age"
+    ],
+
+    "IBC": [
+        "SUBTYPE", "TCGA_PANCANATLAS_CANCER_TYPE_ACRONYM",
+        "DIAGNOSIS_AGE", "SEX", "RACE_CATEGORY",
+        "NEOPLASM_HISTOLOGIC_GRADE",
+        "NEOPLASM_DISEASE_STAGE_AMERICAN_JOINT_COMMITTEE_ON_CANCER_CODE",
+        "AMERICAN_JOINT_COMMITTEE_ON_CANCER_TUMOR_STAGE_CODE",
+        "NEOPLASM_DISEASE_LYMPH_NODE_STAGE_AMERICAN_JOINT_COMMITTEE_ON_CANCER_CODE",
+        "TMB", "ANEUPLOIDY_SCORE",
+        "MSI_MANTIS_SCORE", "MSISENSOR_SCORE",
+        "SAMPLE_TYPE"
+    ],
+    "OV": [
+        "SUBTYPE", "TCGA_PANCANATLAS_CANCER_TYPE_ACRONYM",
+        "DIAGNOSIS_AGE", "SEX", "RACE_CATEGORY",
+        "NEOPLASM_HISTOLOGIC_GRADE",
+        "NEOPLASM_DISEASE_STAGE_AMERICAN_JOINT_COMMITTEE_ON_CANCER_CODE",
+        "ANEUPLOIDY_SCORE", "TMB", "TUMOR_BREAK_LOAD",
+        "MSI_MANTIS_SCORE", "MSISENSOR_SCORE",
+        "SAMPLE_TYPE"
+    ],
+    "COAD": [
+        "SUBTYPE", "DIAGNOSIS_AGE", "SEX", "RACE_CATEGORY",
+        "TUMOR_DISEASE_ANATOMIC_SITE", "NEOPLASM_HISTOLOGIC_GRADE",
+        "NEOPLASM_DISEASE_STAGE_AMERICAN_JOINT_COMMITTEE_ON_CANCER_CODE",
+        "MSI", "MSISENSOR", "MANTIS", "TMB", "ANEUPLOIDY_SCORE",
+        "SAMPLE_TYPE"
+    ]
+}
+
+def select_known_clinicals(clin_df: pd.DataFrame, cancer: str) -> pd.DataFrame:
+    """
+    Subset the clinical dataframe to keep only 'known at diagnosis' variables
+    relevant for the given cancer type.
+
+    Parameters
+    ----------
+    clin_df : pd.DataFrame
+        Clinical dataframe (rows = samples)
+    cancer : str
+        One of {'AML','ALL','IBC','OV','COAD'} (case-insensitive)
+
+    Returns
+    -------
+    pd.DataFrame : filtered dataframe with only known baseline clinicals
+    """
+    cancer = cancer.upper()
+    if cancer not in CLIN_FEATURES:
+        raise ValueError(f"Unknown cancer type '{cancer}'. Must be one of {list(CLIN_FEATURES.keys())}")
+
+    keep_patterns = [re.compile(k, re.I) for k in CLIN_FEATURES[cancer]]
+    matched_cols = []
+    for c in clin_df.columns:
+        for pat in keep_patterns:
+            if pat.search(c):
+                matched_cols.append(c)
+                break
+
+    matched_cols = sorted(set(matched_cols))
+    if not matched_cols:
+        print(f"[Warning] No baseline clinicals matched for {cancer}. Returning empty DataFrame.")
+        return pd.DataFrame(index=clin_df.index)
+
+    return clin_df.loc[:, matched_cols]
+
+
+# ============================================================
+# 9. Altertaion and Feature Encoding
+# ============================================================
+
+
+def encode_altertaions_clinical(mutation_df, cna_df, fusion_df, clinical_df, rna_df, disease):
+
+    # --- 1️⃣ Select and clean clinical variables ---
+    clin_all_filtered = select_known_clinicals(clinical_df, disease)
+    print("Kept columns:", list(clin_all_filtered.columns))
+
+    # Apply 25% missingness threshold
+    threshold = 0.25
+    clin_filtered = clin_all_filtered.loc[:, clin_all_filtered.isna().mean() <= threshold].copy()
+
+    # Fill remaining NaNs (categorical = 'Unknown', numeric = 0)
+    for col in clin_filtered.columns:
+        if clin_filtered[col].dtype == object:
+            clin_filtered[col] = clin_filtered[col].fillna("Unknown")
+    #     else:
+    #         clin_filtered[col] = pd.to_numeric(clin_filtered[col], errors="coerce").fillna(0.0)
+
+    print(f"Kept {clin_filtered.shape[1]} columns out of {clin_all_filtered.shape[1]}")
+    print(f"Remaining NaNs: {clin_filtered.isna().sum().sum()}")
+
+    # --- 2️⃣ Align all data types by sample ---
+    bin_alt_real = pd.concat(
+        [mutation_df, fusion_df, cna_df, clin_filtered],
+        axis=1, join='inner'
+    )
+
+    # Align to RNA expression samples
+    common_samples = bin_alt_real.index.intersection(rna_df.index)
+    X_aligned = bin_alt_real.loc[common_samples].sort_index()
+    Y_aligned = rna_df.loc[common_samples].sort_index()
+
+    print(f"Aligned shapes → X: {X_aligned.shape}, Y: {Y_aligned.shape}")
+
+    possible_numeric = ["DIAGNOSIS_AGE", "TMB", "MSISENSOR_SCORE", "MSI_MANTIS_SCORE", 'Age','ANEUPLOIDY_SCORE', 'TUMOR_BREAK_LOAD', 'TMB_(NONSYNONYMOUS)']
+
+    for col in possible_numeric:
+        if col in X_aligned.columns:
+            X_aligned[col] = pd.to_numeric(X_aligned[col], errors="coerce")
+
+
+    # --- 3️⃣ Encode categorical variables and scale everything ---
+    non_numeric_cols = X_aligned.select_dtypes(include=["object", "category"]).columns
+    numeric_cols = X_aligned.select_dtypes(exclude=["object", "category"]).columns
+
+    print(f"Encoding {len(non_numeric_cols)} non-numeric columns")
+
+    # One-hot encode only categorical columns
+    X_encoded = pd.get_dummies(X_aligned, columns=non_numeric_cols, drop_first=False, dtype=float)
+    print(f"Remaining NaNs: {X_encoded.isna().sum().sum()}")
+
+    # Scale all features
+    scaler = StandardScaler()
+    Xs = scaler.fit_transform(X_encoded)
+
+    # Rebuild DataFrame
+    Xs = pd.DataFrame(Xs, index=X_encoded.index, columns=X_encoded.columns)
+    Xs = Xs.fillna(0.0)
+    print(f"Remaining NaNs: {Xs.isna().sum().sum()}")
+    print("Final Xs shape:", Xs.shape)
+    
+    return Xs
+
+
+# ============================================================
+# 10. PRE-RNA SIMULATION PROCESSING
+# ============================================================
 
 
 def preprocess_rna_for_simulation(rna_df, strategy="auto", user_scale=None, verbose=True):
