@@ -1,9 +1,13 @@
 import numpy as np
 import pandas as pd
+import os
 import random
 from sklearn.neighbors import NearestNeighbors
 from pydeseq2.dds import DeseqDataSet  
 from scipy import sparse
+from numpy.random import default_rng
+from sklearn.preprocessing import StandardScaler
+
 
 # ==============================================================
 # RNA SIMULATION PIPELINE
@@ -15,7 +19,9 @@ from scipy import sparse
 # 0 - HELPER FUNCTIONS
 # ==============================================================
 
-def sample_size(n_mean):
+
+def sample_size(n_mean, seed=44, fallback_size_range=None):
+    rng = np.random.default_rng(seed)
     #Using the DESeq2 signature size, sample this number and combat mam
     #Fallback
     if n_mean is None or n_mean <= 0 or not np.isfinite(n_mean):
@@ -27,7 +33,8 @@ def sample_size(n_mean):
     return max(1, L)
 
 
-def sample_abs(mu, sigma, cap):
+def sample_abs(mu, sigma, cap, seed=44, fallback_abs_range=None):
+    rng = np.random.default_rng(seed)
     # Sample absolute effect value from lognormal distribution
     # If params missing, use uniform fallback
     if mu is None or sigma is None or (not np.isfinite(mu)) or (not np.isfinite(sigma)):
@@ -40,7 +47,8 @@ def sample_abs(mu, sigma, cap):
         val = min(val, float(cap))
     return float(val)
 
-def build_targets_default(base_gene, L):
+def build_targets_default(base_gene, L, seed=44, genes = None, gene_set = None):
+    rng = np.random.default_rng(seed)
     # Choose targets without sharing rules ( exclusive GOFs/LOFs/AMPs/DELs)
     # If base_gene exists, force it in the signature
     # Fill remaining target slots with random (no replacement)
@@ -55,11 +63,16 @@ def build_targets_shared(
     L,
     ref_targets,
     share_frac,
+    seed=44,
+    gene_set=None,
+    genes = None
 ):
     """
     Choose targets with sharing rules. (GOF signatures approx = AMP signatures, LOF signatures approx= DEL signatures)
     If base_gene ecists, force it into the signatures
     """
+
+    rng = np.random.default_rng(seed)
     forced = [base_gene] if base_gene in gene_set else []
     remaining_slots = max(0, L - len(forced))
 
@@ -491,43 +504,148 @@ def simulate_background_from_alterations_knn(
 # ==============================================================
 # 3. GENERATE SIGNATURES
 # ==============================================================
+import numpy as np
+
 
 def generate_signatures_from_deseq2_params(
     genes,
     alteration_features,
     alt_params,
-    cna_gistic_df = None,
     seed = 44,
-    size_jitter = 0.25,
 
-    # direction bias defaults
-    gof_p_pos: float = 0.85,
-    lof_p_pos: float = 0.15,
-    fusion_p_pos: float = 0.50,
+    # direction bias defaults (can later be empirical)
+    gof_p_pos = 0.85,
+    lof_p_pos = 0.15,
+    fusion_p_pos = 0.50,
 
     # AMP/DEL target sharing with GOF/LOF
-    share_frac: float = 0.70,
-    share_amp_with_gof: bool = True,
-    share_del_with_lof: bool = True,
+    share_frac =0.70,
+    share_amp_with_gof = True,
+    share_del_with_lof = True,
 
     # fallbacks if params missing/invalid
     fallback_abs_range=(1.0, 2.0),
     fallback_size_range=(10, 50),
 ):
     """
-    Create signatures using DESeq2-derived parameters.
+    Create truth signatures using DESeq2-derived parameters.
 
-    For each alteration feature `alt` (e.g., NRAS_GOF, TP53_LOF, TP53_AMP, TP53_DEL, ETV6--RUNX1_FUSION):
-      - signature size is sampled around DESeq2-derived size_mean (n_sig)
-      - absolute effect magnitudes (abs log2FC) are sampled from lognormal parameters
-      - sign is sampled from alteration-type bias (p_pos)
+    For each alteration feature `alt`:
+      - signature size ~ Normal(size_mean, size_jitter*size_mean) with floor at 1
+      - absolute magnitudes sampled from lognormal(abs_mu, abs_sigma) then capped at abs_cap
+      - sign sampled from alteration-type bias p_pos
       - base gene is included as a target if present in gene universe
-      - If base_gene_GOF signature exists and we are generating base_gene_AMP:
-            AMP shares ~share_frac of its (non-base) targets with GOF targets, rest are AMP-specific
-      - If base_gene_LOF signature exists and we are generating base_gene_DEL:
-            DEL shares ~share_frac of its (non-base) targets with LOF targets, rest are DEL-specific
+
+    Additional rule:
+      - If base_gene_GOF exists and generating base_gene_AMP:
+          AMP shares ~share_frac of its non-base targets with GOF targets
+      - If base_gene_LOF exists and generating base_gene_DEL:
+          DEL shares ~share_frac of its non-base targets with LOF targets
     """
-    
+    rng = np.random.default_rng(seed)
+
+    genes = list(map(str, genes))
+    gene_set = set(genes)
+
+    # Ensure GOF/LOF created before AMP/DEL so sharing can happen
+    alteration_features = sorted(
+        map(str, alteration_features),
+        key=lambda a: (a.endswith("_AMP") or a.endswith("_DEL"), a)
+    )
+
+    signatures = {}
+
+    for alt in alteration_features:
+        # must exist in params to generate
+        if alt not in alt_params:
+            continue
+
+        kind, base_gene, partners = parse_alt(alt)  # <-- you provide this helper
+
+        p = alt_params[alt]
+        L = sample_size(p.get("size_mean"), seed=44, fallback_size_range=fallback_size_range)
+        L = min(L, len(genes))
+
+        # ----- TARGETS (with AMP/DEL sharing rules) -----
+        targets = None
+
+        if base_gene is not None and base_gene in gene_set:
+            if share_amp_with_gof and alt.endswith("_AMP"):
+                ref_key = f"{base_gene}_GOF"
+                if ref_key in signatures:
+                    targets = build_targets_shared(base_gene, L, signatures[ref_key]["targets"], share_frac)
+
+            elif share_del_with_lof and alt.endswith("_DEL"):
+                ref_key = f"{base_gene}_LOF"
+                if ref_key in signatures:
+                    targets = build_targets_shared(base_gene, L, signatures[ref_key]["targets"], share_frac, gene_set=gene_set, genes=genes)
+
+        if targets is None:
+            targets = build_targets_default(base_gene, L, gene_set=gene_set, genes=genes)
+
+        # ----- SIGN BIAS -----
+        if alt.endswith("_AMP"):
+            p_pos = gof_p_pos
+        elif alt.endswith("_DEL"):
+            p_pos = lof_p_pos
+        elif kind == "GOF":
+            p_pos = gof_p_pos
+        elif kind == "LOF":
+            p_pos = lof_p_pos
+        elif kind == "FUSION":
+            p_pos = fusion_p_pos
+        else:
+            p_pos = 0
+
+        # ----- EFFECTS -----
+        effects = {}
+        for t in targets:
+            mag = sample_abs(p.get("abs_mu"), p.get("abs_sigma"), p.get("abs_cap"), fallback_abs_range=fallback_abs_range)
+            sign = 1.0 if rng.random() < float(p_pos) else -1.0
+
+            # enforce self-direction for core driver
+            if base_gene is not None and t == base_gene:
+                if kind == "GOF" or alt.endswith("_AMP"):
+                    sign = 1.0
+                if kind == "LOF" or alt.endswith("_DEL"):
+                    sign = -1.0
+
+            effects[t] = float(sign * mag)
+
+        signatures[alt] = {
+            "targets": targets,
+            "effects": effects,
+            "effect_mode": "log2fc",
+        }
+
+    return signatures
+
+
+
+def induce_expression_effects(
+    expr_df,
+    alteration_df,
+    signatures,
+    cna_gistic_df= None,
+    floor_zero = True,
+):
+    """
+    Induction of alteration signature effects into a mean-expression matrix (μ space).
+    Effect model:
+      - Each signature stores per-target signed log2FC values.
+      - Effects add in log2-space:
+            total_log2FC[sample,gene] = Σ_alt (alt_value * log2FC_alt_gene)
+        where alt_value is:
+            - 0/1 for GOF/LOF/FUSION (binary)
+            - 0/1/2 for AMP/DEL if cna_gistic_df provided (severity weighted)
+      - Apply in μ space:
+            μ_new = μ_old * 2^(total_log2FC)
+
+    Returns
+    -------
+    pd.DataFrame : modified μ matrix (samples × genes)
+    """
+
     # -----------------------------
     # 0) Align samples
     # -----------------------------
@@ -538,51 +656,46 @@ def generate_signatures_from_deseq2_params(
     mu_df = expr_df.loc[common_idx].copy()
     A_df = alteration_df.loc[common_idx].copy()
 
-    # Optional CNA alignment (for severity weighting)
+    # Align CNA severity if provided
     if cna_gistic_df is not None:
-        cna_common = common_idx.intersection(cna_gistic_df.index)
+        cna_common = mu_df.index.intersection(cna_gistic_df.index)
         if len(cna_common) == 0:
-            # If CNA provided but doesn't overlap, ignore it rather than crash
             cna_gistic_df = None
         else:
-            # Restrict all matrices to the intersection so indexing stays consistent
             mu_df = mu_df.loc[cna_common]
             A_df = A_df.loc[cna_common]
             cna_gistic_df = cna_gistic_df.loc[cna_common]
 
     # -----------------------------
-    # 1) Keep only alteration columns that exist in signatures
+    # 1) Keep only alterations that have signatures
     # -----------------------------
     alts = [str(a) for a in A_df.columns if str(a) in signatures]
     if len(alts) == 0:
         return mu_df
 
+    # numeric, keep as weights (still 0/1 for binaries)
     A_df = A_df[alts].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+    A_df[A_df < 0] = 0.0
 
     # -----------------------------
-    # 2) If CNA gistic provided, replace AMP/DEL 0/1 with severity 0/1/2 from gene-level CNA states
+    # 2) Replace AMP/DEL 0/1 with severity 0/1/2 from CNA gistic
     # -----------------------------
     if cna_gistic_df is not None:
         cna = cna_gistic_df.apply(pd.to_numeric, errors="coerce").fillna(0.0)
-        cna = np.rint(cna).astype(int)
-        cna = cna.clip(-2, 2)
+        cna = np.rint(cna).astype(int).clip(-2, 2)
 
-        # For each AMP/DEL feature, look up its base gene in the CNA matrix and overwrite column values
         for col in A_df.columns:
             if col.endswith("_AMP"):
                 gene = col[:-4]
                 if gene in cna.columns:
-                    A_df[col] = cna[gene].clip(lower=0).astype(float)   # 0/1/2
+                    A_df[col] = cna[gene].clip(lower=0).astype(float)  # 0/1/2
             elif col.endswith("_DEL"):
                 gene = col[:-4]
                 if gene in cna.columns:
                     A_df[col] = (-cna[gene]).clip(lower=0).astype(float)  # 0/1/2
 
-    # Ensure non-negative weights (safety)
-    A_df[A_df < 0] = 0.0
-
     # -----------------------------
-    # 3) Determine which genes are affected at all (targets ∩ mu columns)
+    # 3) Determine affected genes (targets ∩ mu columns)
     # -----------------------------
     mu_cols = list(map(str, mu_df.columns))
     mu_gene_set = set(mu_cols)
@@ -590,8 +703,6 @@ def generate_signatures_from_deseq2_params(
     affected_genes = set()
     for alt in alts:
         sig = signatures.get(alt, {})
-        if sig.get("effect_mode", "log2fc") != "log2fc":
-            raise ValueError(f"Unsupported effect_mode for {alt}: {sig.get('effect_mode')}")
         eff = sig.get("effects", {}) or {}
         for tgt in eff.keys():
             tgt = str(tgt)
@@ -605,24 +716,23 @@ def generate_signatures_from_deseq2_params(
     mu_sub = mu_df[affected_genes].to_numpy(dtype=float, copy=True)
 
     # -----------------------------
-    # 4) Build sparse A (samples × alts), allowing weights (0/1/2) for AMP/DEL
+    # 4) Build sparse A (samples × alts) with weights (0/1/2)
     # -----------------------------
     A = sparse.csr_matrix(A_df.to_numpy(dtype=float))
 
     # -----------------------------
-    # 5) Build sparse E (alts × affected_genes) of log2FC effects
+    # 5) Build sparse E (alts × affected_genes) of per-target log2FC
     # -----------------------------
     alt_to_i = {alt: i for i, alt in enumerate(alts)}
     gene_to_j = {g: j for j, g in enumerate(affected_genes)}
 
     rows, cols, data = [], [], []
-
     for alt in alts:
         i = alt_to_i[alt]
         eff = signatures[alt].get("effects", {}) or {}
         for tgt, log2fc in eff.items():
             tgt = str(tgt)
-            j = gene_to_j.get(tgt, None)
+            j = gene_to_j.get(tgt)
             if j is None:
                 continue
             rows.append(i)
@@ -639,166 +749,18 @@ def generate_signatures_from_deseq2_params(
     E.sum_duplicates()
 
     # -----------------------------
-    # 6) Total log2FC per sample×gene: L = A @ E
+    # 6) Total log2FC per sample×gene and apply μ *= 2^L
     # -----------------------------
     L = (A @ E).tocoo()
-
-    # Apply fold-change only where L is non-zero (sparse update)
-    # μ_new = μ_old * 2^(log2FC_total)
     mu_sub[L.row, L.col] *= np.power(2.0, L.data)
 
-    # Write back
     mu_df.loc[:, affected_genes] = mu_sub
 
-    # -----------------------------
-    # 7) Safety floor
-    # -----------------------------
     if floor_zero:
         mu_df[mu_df < 0] = 0.0
 
     return mu_df
 
-
-def generate_expression_effects(
-    expr_df,
-    alteration_df,
-    signatures,
-    floor_zero,
-):
-    """
-    Generation of binary alteration effects into a mean-expression (mu) matrix.
-
-    Assumptions
-    ----------
-    - alteration_df is binary (0/1) with columns corresponding to alteration features (GOF/LOF/FUSION/AMP/DEL)
-    - signatures[alt]["effects"] contains per-target signed log2FC values.
-    - Multiple active alterations affecting the same target gene add in log2-space
-      (equivalent to multiplying fold-changes in expression space).
-
-    Method
-    ------
-    Build two sparse matrices:
-      A: (n_samples x n_alts)  binary alteration presence
-      E: (n_alts x n_targets)  log2FC effects for targets
-
-    Then:
-      L = A @ E  => (n_samples x n_targets) total log2FC per sample×gene (sparse)
-
-    Apply:
-      mu[:, targets] *= 2 ** L
-    """
-
-    # -----------------------------
-    # 0) Align samples
-    # -----------------------------
-    common_idx = expr_df.index.intersection(alteration_df.index)
-    if len(common_idx) == 0:
-        raise ValueError("No overlapping samples between expr_df and alteration_df.")
-
-    mu_df = expr_df.loc[common_idx].copy()
-    A_df = alteration_df.loc[common_idx]
-
-    # -----------------------------
-    # 1) Keep only alterations we can actually apply (present in signatures)
-    # -----------------------------
-    alts = [str(a) for a in A_df.columns if str(a) in signatures]
-    if len(alts) == 0:
-        return mu_df  # nothing to apply
-
-    A_df = A_df[alts].astype(np.int8)
-
-    # -----------------------------
-    # 2) Determine which genes are ever affected (targets ∩ mu columns)
-    #    (We only compute updates for these genes.)
-    # -----------------------------
-    mu_genes = set(map(str, mu_df.columns))
-    affected_genes = set()
-
-    for alt in alts:
-        sig = signatures.get(alt, {})
-        if sig.get("effect_mode", "log2fc") != "log2fc":
-            raise ValueError(f"Unsupported effect_mode for {alt}: {sig.get('effect_mode')}")
-        eff = sig.get("effects", {}) or {}
-        for tgt in eff.keys():
-            tgt = str(tgt)
-            if tgt in mu_genes:
-                affected_genes.add(tgt)
-
-    if len(affected_genes) == 0:
-        return mu_df  # no overlap between signature targets and expression genes
-
-    affected_genes = list(affected_genes)
-    affected_genes.sort()
-
-    # Submatrix of mu we actually need to update
-    mu_sub = mu_df[affected_genes].to_numpy(dtype=float, copy=True)
-
-    # -----------------------------
-    # 3) Build sparse A (samples x alts)
-    # -----------------------------
-    # Using CSR is efficient for matrix multiplication.
-    A = sparse.csr_matrix(A_df.to_numpy(dtype=np.int8))
-
-    # -----------------------------
-    # 4) Build sparse E (alts x affected_genes)
-    # -----------------------------
-    alt_to_i = {alt: i for i, alt in enumerate(alts)}
-    gene_to_j = {g: j for j, g in enumerate(affected_genes)}
-
-    # We'll assemble E in COO then convert to CSR
-    rows, cols, data = [], [], []
-
-    for alt in alts:
-        i = alt_to_i[alt]
-        eff = signatures[alt].get("effects", {}) or {}
-
-        for tgt, log2fc in eff.items():
-            tgt = str(tgt)
-            j = gene_to_j.get(tgt, None)
-            if j is None:
-                continue  # target not in mu_df columns
-
-            # Add entry: E[i, j] += log2fc
-            rows.append(i)
-            cols.append(j)
-            data.append(float(log2fc))
-
-    if len(data) == 0:
-        return mu_df
-
-    E = sparse.coo_matrix(
-        (np.array(data, dtype=float), (np.array(rows), np.array(cols))),
-        shape=(len(alts), len(affected_genes)),
-    ).tocsr()
-
-    # If duplicates existed (same alt->tgt listed twice), CSR will sum them automatically
-    E.sum_duplicates()
-
-    # -----------------------------
-    # 5) Compute total log2FC matrix L = A @ E  (samples x affected_genes)
-    # -----------------------------
-    # This is sparse and scales with:
-    #   (#active alts per sample) * (#targets per alt)
-    L = A @ E  # CSR @ CSR -> CSR
-
-    # -----------------------------
-    # 6) Apply fold-change: mu *= 2^(log2FC_total) for nonzero entries only
-    # -----------------------------
-    L = L.tocoo()  # easy access to (row, col, value)
-
-    # Multiply only the affected cells (sparse update)
-    mu_sub[L.row, L.col] *= np.power(2.0, L.data)
-
-    # Put back into dataframe
-    mu_df.loc[:, affected_genes] = mu_sub
-
-    # -----------------------------
-    # 7) Safety floor
-    # -----------------------------
-    if floor_zero:
-        mu_df[mu_df < 0] = 0.0
-
-    return mu_df
 
 
 # ==============================================================
@@ -819,8 +781,8 @@ def simulate_rna_with_signatures(
     residual_scale=0.5,
     metric="euclidean",
     use_deseq_size_factors=True,
-    deseq2_summary_path = None
-    deseq2_summary_df = None
+    deseq2_summary_path = None,
+    deseq2_summary_df = None,
     deseq2_alteration_col = "alteration",
     deseq2_n_sig_col = "n_sig",
     deseq2_mean_abs_col = "mean_abs_log2FC_sig",
@@ -923,18 +885,17 @@ def simulate_rna_with_signatures(
             alteration_features=truth_features,
             alt_params=alt_params,
             seed=seed,
-            size_jitter=size_jitter,
             gof_p_pos=gof_p_pos,
             lof_p_pos=lof_p_pos,
             fusion_p_pos=fusion_p_pos,
         )
 
     # Inject effects
-    expr_effected = inject_expression_effects(
+    expr_effected = induce_expression_effects(
         expr_df=expr_bg_mu,
         alteration_df=alt,                 # your binary GOF/LOF/FUSION/AMP/DEL
         signatures=true_signatures,
-        cna_gistic_df=cna_df_gistic,       # the severity matrix (-2..2)
+        cna_gistic_df=cna_df,       # the severity matrix (-2..2)
         floor_zero=True,
     )
 
