@@ -1,4 +1,3 @@
-
 # ========================
 # Libraries
 # ========================
@@ -9,6 +8,7 @@ import pandas as pd
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.linear_model import LogisticRegressionCV, LogisticRegression, LassoCV, ElasticNetCV, Ridge
 from sklearn.svm import SVC, SVR
+from sklearn.svm import LinearSVC
 
 
 # Dimensionality reduction / clustering
@@ -46,7 +46,7 @@ from Deconfounder import *
 Helper Functions
 '''
 
-def _select_features_elbow(feature_names, weights, tol=1e-8):
+def select_features_elbow(feature_names, weights, tol=1e-8):
     """
     Elbow-based feature selector.
 
@@ -137,7 +137,7 @@ def normalize_counts_log_cpm(Y_counts, libsize_target=1e4):
 
 
 '''
-CLASSFICATION METHODS
+For Binary Features (Mutations/Fusions) use classification algorithims
 '''
 
 def get_lasso_class_signature(X, y, tol=1e-6, cv=3, Cs=10, max_iter=3000, n_jobs=4):
@@ -147,13 +147,11 @@ def get_lasso_class_signature(X, y, tol=1e-6, cv=3, Cs=10, max_iter=3000, n_jobs
     model = LogisticRegressionCV(
         penalty="l1",
         solver="saga",              # faster/more scalable than liblinear for many features
-        class_weight="balanced",
         random_state=44,
         cv=cv,
         Cs=Cs,
         max_iter=max_iter,
-        n_jobs=n_jobs,
-        scoring="balanced_accuracy",
+        n_jobs=n_jobs
     )
     model.fit(X, y)
     coefs = model.coef_[0]
@@ -167,28 +165,23 @@ def get_elasticnet_class_signature(X, y, tol=1e-6, cv=3, Cs=10, max_iter=3000, n
     model = LogisticRegressionCV(
         penalty="elasticnet",
         solver="saga",
-        class_weight="balanced",
         l1_ratios=[0.5],
         random_state=44,
         cv=cv,
         Cs=Cs,
         max_iter=max_iter,
-        n_jobs=n_jobs,
-        scoring="balanced_accuracy",
+        n_jobs=n_jobs
     )
     model.fit(X, y)
     coefs = model.coef_[0]
     return X.columns[np.abs(coefs) > tol].tolist()
 
 
-from sklearn.svm import LinearSVC
-
 def get_svm_class_signature(X, y):
     if len(np.unique(y.dropna())) < 2:
         return []
 
     model = LinearSVC(
-        class_weight="balanced",
         random_state=44,
         max_iter=5000,
         tol=1e-3,
@@ -196,11 +189,11 @@ def get_svm_class_signature(X, y):
     model.fit(X, y)
 
     coefs = model.coef_[0]
-    return _select_features_elbow(X.columns, coefs)
+    return select_features_elbow(X.columns, coefs)
 
 
 
-def get_ridgereg_class_signature(X, y):
+def get_ridgereg_class_signature(X, y, tol=1e-3):
     """Logistic regression with L2: elbow on |weights|."""
     if len(np.unique(y.dropna())) < 2:
         return []
@@ -208,16 +201,14 @@ def get_ridgereg_class_signature(X, y):
     model = LogisticRegression(
         penalty="l2",
         solver="saga",
-        class_weight="balanced",
         random_state=44,
         max_iter=3000,
-        tol=1e-3,
-        n_jobs=4,   # saga supports this
+        tol=tol
     )
 
     model.fit(X, y)
     coefs = model.coef_[0]
-    return _select_features_elbow(X.columns, coefs)
+    return select_features_elbow(X.columns, coefs)
 
 
 def get_rf_class_signature(X, y):
@@ -226,15 +217,13 @@ def get_rf_class_signature(X, y):
         return []
 
     model = RandomForestClassifier(
-        class_weight='balanced',
         random_state=44,
         n_estimators=200,
         max_depth=12,
-        n_jobs=4,
     )
     model.fit(X, y)
     importances = model.feature_importances_
-    return _select_features_elbow(X.columns, importances)
+    return select_features_elbow(X.columns, importances)
 
 '''
 DESEQ2
@@ -310,74 +299,6 @@ def get_deconfounder_signature(gof, global_results):
     gene_signature = coefs_tr[[gof]].dropna()
     return list(gene_signature.index)
 
-
-'''
-Wrapper Functions
-'''
-import pandas as pd
-import numpy as np
-
-def fix_cnas_before_models(
-    X: pd.DataFrame,
-    cna_suffix: str = "_CNA",
-    amp_suffix: str = "_AMP",
-    del_suffix: str = "_DEL",
-    amp_threshold: float = 2.0,
-    del_threshold: float = 2.0,
-    drop_constant: bool = True,
-    min_unique: int = 2,
-    min_std: float = 1e-8,
-) -> pd.DataFrame:
-    """
-    Replace continuous CNA columns (*_CNA) with two binary features:
-      - *_AMP: 1 if CNA > 2 else 0
-      - *_DEL: 1 if CNA < 2 else 0
-      (exactly 2 -> 0 for both)
-
-    Optionally drops constant/near-constant predictors after conversion.
-    """
-    X = X.copy()
-
-    cna_cols = [c for c in X.columns if str(c).endswith(cna_suffix)]
-    if len(cna_cols) == 0:
-        return X
-
-    # numeric CNA values
-    cna_vals = X[cna_cols].apply(pd.to_numeric, errors="coerce")
-
-    amp = (cna_vals > amp_threshold).astype("int8")
-    dele = (cna_vals < del_threshold).astype("int8")
-
-    amp.columns = [str(c).replace(cna_suffix, amp_suffix) for c in cna_cols]
-    dele.columns = [str(c).replace(cna_suffix, del_suffix) for c in cna_cols]
-
-    # drop original CNA, add AMP/DEL
-    X = X.drop(columns=cna_cols)
-    X = pd.concat([X, amp, dele], axis=1)
-
-    if not drop_constant:
-        return X
-
-    # drop constant / near-constant predictors globally
-    constant_cols = []
-    for col in X.columns:
-        s = pd.to_numeric(X[col], errors="coerce")
-        s2 = s.dropna()
-        if s2.empty:
-            constant_cols.append(col)
-            continue
-        nunq = s2.nunique(dropna=True)
-        std = float(s2.std())
-        if nunq < min_unique or not (std > min_std):
-            constant_cols.append(col)
-
-    if constant_cols:
-        X = X.drop(columns=constant_cols)
-
-    return X
-
-
-
 def class_supervised_signatures(Y_norm_df, x):
     """
     Supervised signatures for binary alterations (mutations, fusions, binarised CNAs).
@@ -388,11 +309,9 @@ def class_supervised_signatures(Y_norm_df, x):
     signatures['Lasso']               = get_lasso_class_signature(Y_norm_df, x)
     signatures['ElasticNet']          = get_elasticnet_class_signature(Y_norm_df, x)
     signatures['SVM']                 = get_svm_class_signature(Y_norm_df, x)
-    signatures['Ridge Regression']    = get_ridgereg_class_signature(Y_norm_df, x)
+    signatures['Ridge']               = get_ridgereg_class_signature(Y_norm_df, x)
     return signatures
 
-import pandas as pd
-import numpy as np
 
 def create_supervised_signatures(
     X,
@@ -437,7 +356,7 @@ def create_supervised_signatures(
     if nunq < min_unique_x or not (std > min_std_x):
         return {"SKIPPED": f"{gof}: predictor constant/low-var (n_unique={nunq}, std={std})"}
 
-    # ---- NEW: group-size guard ----
+    # ---- group-size guard ----
     vc = x.value_counts()
     if (0 not in vc) or (1 not in vc) or (vc[0] < min_group_n) or (vc[1] < min_group_n):
         return {"SKIPPED": f"{gof}: insufficient group sizes {vc.to_dict()} (min_group_n={min_group_n})"}
@@ -477,5 +396,6 @@ def create_supervised_signatures(
         signatures["DESeq2_ERROR"] = repr(e)
 
     return signatures
+
 
 
