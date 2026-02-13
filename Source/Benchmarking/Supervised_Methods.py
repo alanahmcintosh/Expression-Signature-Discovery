@@ -1,3 +1,4 @@
+
 # ========================
 # Libraries
 # ========================
@@ -30,12 +31,7 @@ from scipy.spatial.distance import squareform
 # RNA-seq differential expression
 from pydeseq2.dds import DeseqDataSet
 from pydeseq2.ds import DeseqStats
-try:
-    # Newer API (if they ever move it here)
-    from pydeseq2.inference import DefaultInference
-except ImportError:
-    # Your installed version (0.4.12) puts it here
-    from pydeseq2.default_inference import DefaultInference
+from pydeseq2.default_inference import DefaultInference
 
 
 from pandas.api.types import CategoricalDtype
@@ -141,7 +137,7 @@ def normalize_counts_log_cpm(Y_counts, libsize_target=1e4):
 
 
 '''
-For Binary Features (Mutations/Fusions) use classification algorithims
+CLASSFICATION METHODS
 '''
 
 def get_lasso_class_signature(X, y, tol=1e-6, cv=3, Cs=10, max_iter=3000, n_jobs=4):
@@ -240,199 +236,68 @@ def get_rf_class_signature(X, y):
     importances = model.feature_importances_
     return _select_features_elbow(X.columns, importances)
 
-
-'''
-For Continuous Features (CNAs) use regression algorithims
-'''
-
-def get_lasso_reg_signature(X, y, tol=1e-6, cv=3, max_iter=3000, n_jobs=4):
-    model = LassoCV(cv=cv, random_state=44, n_jobs=n_jobs, max_iter=max_iter, tol=1e-3)
-    model.fit(X, y)
-    coefs = model.coef_
-    return X.columns[np.abs(coefs) > tol].tolist()
-
-
-def get_elasticnet_reg_signature(X, y, tol=1e-6, cv=3, max_iter=3000, n_jobs=4):
-    model = ElasticNetCV(
-        cv=cv,
-        random_state=44,
-        n_jobs=n_jobs,
-        max_iter=max_iter,
-        tol=1e-3,
-        l1_ratio=[0.5],
-    )
-    model.fit(X, y)
-    coefs = model.coef_
-    return X.columns[np.abs(coefs) > tol].tolist()
-
-
-def get_ridge_reg_signature(X, y):
-    model = Ridge(solver="sag", random_state=44, tol=1e-3)
-    model.fit(X, y)
-    coefs = model.coef_
-    return _select_features_elbow(X.columns, coefs)
-
-from sklearn.svm import LinearSVR
-
-def get_svr_reg_signature(X, y):
-    model = LinearSVR(
-        random_state=44,
-        max_iter=5000,
-        tol=1e-3,
-    )
-    model.fit(X, y)
-    coefs = model.coef_
-    return _select_features_elbow(X.columns, coefs)
-
-
-def get_rf_reg_signature(X, y):
-    model = RandomForestRegressor(
-        random_state=44,
-        n_estimators=200,
-        n_jobs=4,
-        max_depth=12
-    )
-    model.fit(X, y)
-    importances = model.feature_importances_
-    return _select_features_elbow(X.columns, importances)
-
 '''
 DESEQ2
 '''
 
-
-def get_deseq2_signature_binary(X, Y, gof):
+def get_deseq2_signature_binary(
+    X, Y, gof,
+    n_cpus=4,
+    alpha=0.05,
+    min_group_n=1,
+):
     """
-    X_train: mutation/CNA/fusion matrix
-    Y_train: gene expression count matrix (int)
-    gof: alteration of interest
+    PyDESeq2 v0.4.12-compatible binary DE signature.
+    Uses design_factors (NOT design=...).
     """
-    # Only keep the alteration of interest in metadata
-    metadata = X.copy()
-    counts_df = Y.astype(int)
-    inference = DefaultInference(n_cpus=4)
 
-    # Make sure it's binary categorical
-    # Make sure it's binary categorical (robust to 0.0/1.0, True/False, strings)
-    s = pd.to_numeric(metadata[gof], errors="coerce").fillna(0).astype(int)
-    metadata[gof] = s.astype(str).astype("category")
-    metadata[gof] = metadata[gof].cat.reorder_categories(["0", "1"], ordered=True)
+    # raw counts
+    counts = Y.astype(int)
 
+    # predictor
+    x = pd.to_numeric(X[gof], errors="coerce").dropna()
+    if x.shape[0] < 2 * min_group_n:
+        return []
 
+    counts = counts.loc[x.index]
+    x = x.astype(int)
+
+    # group size guard
+    vc = x.value_counts()
+    if (0 not in vc) or (1 not in vc) or vc[0] < min_group_n or vc[1] < min_group_n:
+        return []
+
+    # metadata table (v0.4.x uses metadata=)
+    metadata = pd.DataFrame(index=counts.index)
+    metadata["condition"] = x.astype(str)
+
+    # Make it categorical and set reference level explicitly
+    metadata["condition"] = pd.Categorical(metadata["condition"], categories=["0", "1"])
+
+    # v0.4.12 API: design_factors, ref_level
+    # (DefaultInference exists in 0.4.12, but inference= is optional here)
     dds = DeseqDataSet(
-        counts=counts_df,
+        counts=counts,
         metadata=metadata,
-        design_factors=[gof],
-        refit_cooks=True,
-        inference=inference,
+        design_factors="condition",
+        ref_level=["condition", "0"],
+        refit_cooks=False,
+        n_cpus=n_cpus,
     )
     dds.deseq2()
 
-    contrast = [gof, "1", "0"]
-    stat_res = DeseqStats(dds, contrast=contrast, inference=inference)
+    stat_res = DeseqStats(
+        dds,
+        contrast=["condition", "1", "0"],
+        alpha=alpha,
+    )
     stat_res.summary()
 
-    de = stat_res.results_df
-    significant_genes = de[de['padj'] < 0.05]
-    return list(significant_genes.index)
-
-import numpy as np
-
-def get_deseq2_signature_cont(X, Y, gof, min_std=1e-6):
-    """
-    DESeq2 signature for continuous 0–25 integer-valued GOFs/CNAs.
-    Uses a numeric contrast vector (required in recent PyDESeq2 versions).
-    """
-    # Only keep the alteration of interest in metadata
-    metadata = X.copy()
-    counts_df = Y.astype(int)
-
-    # Force numeric and check variance
-    metadata[gof] = pd.to_numeric(metadata[gof], errors="coerce")
-    col = metadata[gof]
-
-    # Drop rows with NaN in this predictor (if any)
-    valid_idx = col.dropna().index
-    if len(valid_idx) < 3:  # not enough samples to fit anything sensible
-        print(f"[DESeq2 cont] {gof}: <3 non-NaN samples. Skipping.")
-        return []
-
-    col = col.loc[valid_idx]
-    std = col.std()
-
-    if std < min_std:
-        print(f"[DESeq2 cont] {gof}: ~zero variance (std={std:.2e}). Skipping.")
-        return []
-
-    metadata = metadata.loc[valid_idx]
-    counts_df = counts_df.loc[valid_idx]
-
-    inference = DefaultInference(n_cpus=4)
-
-    try:
-        # Simple design with intercept + continuous term
-        dds = DeseqDataSet(
-            counts=counts_df,
-            metadata=metadata,
-            design=f"~ {gof}",      # use formula syntax; continuous auto-detected
-            refit_cooks=True,
-            inference=inference,
-        )
-        dds.deseq2()
-
-        # --- Build numeric contrast vector for the continuous term ---
-        # Get design matrix (can be an attribute or in obsm, depending on version)
-        design = getattr(dds, "design_matrix", None)
-        if design is None:
-            design = dds.obsm["design_matrix"]
-
-        cols = design.columns
-
-        # Column name may be exactly gof, or something like 'gof[]' in some versions
-        if gof in cols:
-            target_col = gof
-        else:
-            matches = [c for c in cols if c.startswith(gof)]
-            if len(matches) != 1:
-                print(f"[DESeq2 cont] {gof}: can't uniquely match to design matrix columns {list(cols)}. Skipping.")
-                return []
-            target_col = matches[0]
-
-        contrast_vec = np.zeros(len(cols), dtype=float)
-        contrast_vec[cols.get_loc(target_col)] = 1.0  # test the slope for this term
-
-        stat_res = DeseqStats(
-            dds,
-            contrast=contrast_vec,    # ✅ numeric contrast vector
-            inference=inference,
-        )
-        stat_res.summary()
-
-        de = stat_res.results_df
-        sig = de[de["padj"] < 0.05]
-        return list(sig.index)
-
-    except Exception as e:
-        print(f"[DESeq2 cont] {gof}: failed with error: {e}")
-        return []
+    res = stat_res.results_df
+    sig = res[res["padj"] < alpha]
+    return list(sig.index)
 
 
-
-def get_deseq2_signature_auto(X, Y, gof):
-    """
-    Automatically choose DESeq2 mode based on feature name.
-
-    - If endswith('_MUT') or endswith('_FUSION') → binary
-    - Else → continuous predictor
-    """
-    gof_lower = gof.lower()
-
-    if gof_lower.endswith("_cna"):
-        print(f"[DESeq2 Auto] {gof}: treated as CONT.")
-        return get_deseq2_signature_cont(X, Y, gof)
-
-    print(f"[DESeq2 Auto] {gof}: treated as BINARY")
-    return get_deseq2_signature_binary(X, Y, gof)
 
 
 '''
@@ -449,6 +314,69 @@ def get_deconfounder_signature(gof, global_results):
 '''
 Wrapper Functions
 '''
+import pandas as pd
+import numpy as np
+
+def fix_cnas_before_models(
+    X: pd.DataFrame,
+    cna_suffix: str = "_CNA",
+    amp_suffix: str = "_AMP",
+    del_suffix: str = "_DEL",
+    amp_threshold: float = 2.0,
+    del_threshold: float = 2.0,
+    drop_constant: bool = True,
+    min_unique: int = 2,
+    min_std: float = 1e-8,
+) -> pd.DataFrame:
+    """
+    Replace continuous CNA columns (*_CNA) with two binary features:
+      - *_AMP: 1 if CNA > 2 else 0
+      - *_DEL: 1 if CNA < 2 else 0
+      (exactly 2 -> 0 for both)
+
+    Optionally drops constant/near-constant predictors after conversion.
+    """
+    X = X.copy()
+
+    cna_cols = [c for c in X.columns if str(c).endswith(cna_suffix)]
+    if len(cna_cols) == 0:
+        return X
+
+    # numeric CNA values
+    cna_vals = X[cna_cols].apply(pd.to_numeric, errors="coerce")
+
+    amp = (cna_vals > amp_threshold).astype("int8")
+    dele = (cna_vals < del_threshold).astype("int8")
+
+    amp.columns = [str(c).replace(cna_suffix, amp_suffix) for c in cna_cols]
+    dele.columns = [str(c).replace(cna_suffix, del_suffix) for c in cna_cols]
+
+    # drop original CNA, add AMP/DEL
+    X = X.drop(columns=cna_cols)
+    X = pd.concat([X, amp, dele], axis=1)
+
+    if not drop_constant:
+        return X
+
+    # drop constant / near-constant predictors globally
+    constant_cols = []
+    for col in X.columns:
+        s = pd.to_numeric(X[col], errors="coerce")
+        s2 = s.dropna()
+        if s2.empty:
+            constant_cols.append(col)
+            continue
+        nunq = s2.nunique(dropna=True)
+        std = float(s2.std())
+        if nunq < min_unique or not (std > min_std):
+            constant_cols.append(col)
+
+    if constant_cols:
+        X = X.drop(columns=constant_cols)
+
+    return X
+
+
 
 def class_supervised_signatures(Y_norm_df, x):
     """
@@ -463,32 +391,26 @@ def class_supervised_signatures(Y_norm_df, x):
     signatures['Ridge Regression']    = get_ridgereg_class_signature(Y_norm_df, x)
     return signatures
 
-
-def reg_supervised_signatures(Y_norm_df, x):
-    """
-    Supervised signatures for continuous alterations (e.g. CNA values).
-    X = normalized RNA, y = continuous alteration (CNA) value.
-    """
-    signatures = {}
-    signatures['Random Forest (reg)']  = get_rf_reg_signature(Y_norm_df, x)
-    signatures['Lasso (reg)']          = get_lasso_reg_signature(Y_norm_df, x)
-    signatures['ElasticNet (reg)']     = get_elasticnet_reg_signature(Y_norm_df, x)
-    signatures['SVR (reg)']            = get_svr_reg_signature(Y_norm_df, x)
-    signatures['Ridge (reg)']          = get_ridge_reg_signature(Y_norm_df, x)
-    return signatures
-
-
+import pandas as pd
+import numpy as np
 
 def create_supervised_signatures(
     X,
     Y,
     gof,
     global_results=None,
-    Y_norm_df=None
+    Y_norm_df=None,
+    min_unique_x=2,
+    min_std_x=1e-8,
+    min_group_n=1,   # NEW: prevent tiny groups
 ):
     """
-    Build signatures for a single alteration (gof).
+    Binary predictor signatures only (mut/fusion/AMP/DEL).
+
+    - ML models use normalized RNA
+    - DESeq2 uses raw counts
     """
+
     # ---- align samples once ----
     common_idx = X.index.intersection(Y.index)
     X = X.loc[common_idx]
@@ -497,36 +419,63 @@ def create_supervised_signatures(
     if gof not in X.columns:
         raise KeyError(f"{gof} not found in X columns.")
 
-    x = X[gof]
+    # predictor
+    x = pd.to_numeric(X[gof], errors="coerce")
+
+    # ---- drop NaNs consistently ----
+    valid_idx = x.dropna().index
+    x = x.loc[valid_idx]
+    Y_sub = Y.loc[valid_idx]
+
+    # ---- enforce 0/1 (important for robustness) ----
+    # if x is already 0/1 this is a no-op; if it’s float, it will coerce cleanly
+    x = x.astype(int)
+
+    # ---- guard: constant / near-constant predictor ----
+    nunq = x.nunique(dropna=True)
+    std = float(x.std())
+    if nunq < min_unique_x or not (std > min_std_x):
+        return {"SKIPPED": f"{gof}: predictor constant/low-var (n_unique={nunq}, std={std})"}
+
+    # ---- NEW: group-size guard ----
+    vc = x.value_counts()
+    if (0 not in vc) or (1 not in vc) or (vc[0] < min_group_n) or (vc[1] < min_group_n):
+        return {"SKIPPED": f"{gof}: insufficient group sizes {vc.to_dict()} (min_group_n={min_group_n})"}
 
     # ---- normalize RNA for ML models (NOT for DESeq2) ----
     if Y_norm_df is None:
         Y_norm_df = normalize_counts_log_cpm(Y)
 
-    # match x to the normalized RNA samples (in case some got dropped)
-    x = x.loc[Y_norm_df.index]
+    common2 = x.index.intersection(Y_norm_df.index)
+    x_ml = x.loc[common2]
+    Y_ml = Y_norm_df.loc[common2]
 
-    # ---- choose classification vs regression based on name ----
-    if gof.endswith("_CNA"):
-        # Uses your existing regression signature function
-        base_sigs = reg_supervised_signatures(Y_norm_df, x) 
-    else:
-        # Uses your existing classification signature function
-        base_sigs = class_supervised_signatures(Y_norm_df, x) 
+    signatures = {}
 
-    signatures = dict(base_sigs)
+    # ---- classification ONLY ----
+    base_sigs = class_supervised_signatures(Y_ml, x_ml)
+    signatures.update(dict(base_sigs))
 
-    # ---- add Deconfounder (never crash the alteration) ----
+    # ---- Deconfounder ----
     if global_results is not None:
         try:
-            signatures['Deconfounder'] = get_deconfounder_signature(gof, global_results)
+            signatures["Deconfounder"] = get_deconfounder_signature(gof, global_results)
         except Exception as e:
-            signatures['Deconfounder_ERROR'] = repr(e)
+            signatures["Deconfounder_ERROR"] = repr(e)
 
-    # ---- add DESeq2 (never crash the alteration) ----
+    # ---- DESeq2 ----
     try:
-        signatures["DESeq2"] = get_deseq2_signature_auto(X, Y, gof)
+        if (Y_sub < 0).any().any():
+            raise ValueError(f"{gof}: Y contains negative values; DESeq2 requires non-negative counts.")
+
+        # NEW: pass only the needed design column
+        X_design = pd.DataFrame({gof: x}, index=x.index)
+
+        signatures["DESeq2"] = get_deseq2_signature_binary(X_design, Y_sub, gof)
+
     except Exception as e:
         signatures["DESeq2_ERROR"] = repr(e)
 
     return signatures
+
+
