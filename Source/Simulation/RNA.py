@@ -80,7 +80,6 @@ def build_targets_shared(
     ref_targets = [g for g in ref_targets if g in gene_set]
     ref_wo_base = [g for g in ref_targets if g != base_gene]
 
-    # how many shared?
     n_shared = int(round(float(share_frac) * float(remaining_slots)))
     n_shared = max(0, min(n_shared, len(ref_wo_base)))
 
@@ -160,7 +159,6 @@ def parse_alt(alt: str):
     if alt.endswith("_FUSION"):
         core = alt[:-7]
         partners = core.split("--") if "--" in core else core.split("-")
-        # base gene can be first partner if you want
         base_gene = partners[0] if partners else None
         return "FUSION", base_gene, partners
 
@@ -228,7 +226,7 @@ def cap_abs_log2fc(mean_abs, abs_max, cap_k = 8.0, global_cap = 12.0):
     """
     Determine uper bound for simulated absolute log2 fold change. 
     Prevents biologically unrealistic outliers
-    Your cap rule: cap at (mean + cap_k), also bounded by abs_max and global_cap.
+    Cap rule: cap at (mean + cap_k), also bounded by abs_max and global_cap.
     Abs_max - > Never exceed whats observed in real data
     Mean_abs + cap_k - > Relative cap based on genes typical effect
     Global_cap -> Prevents explosive values if summary stats are too noisy
@@ -485,7 +483,7 @@ def simulate_background_from_alterations_knn(
         w = rng.dirichlet(np.full(nbrZ.shape[0], mix_conc))
         z_mix = np.average(nbrZ.values, axis=0, weights=w)
 
-        # Optional nois to avoid overfitting 
+        # Optional noise to avoid overfitting 
         if residual_scale and residual_scale > 0:
             z_mix += rng.normal(0, residual_scale, size=z_mix.shape[0])
 
@@ -513,7 +511,7 @@ def generate_signatures_from_deseq2_params(
     alt_params,
     seed = 44,
 
-    # direction bias defaults (can later be empirical)
+    # direction bias defaults 
     gof_p_pos = 0.85,
     lof_p_pos = 0.15,
     fusion_p_pos = 0.50,
@@ -560,7 +558,7 @@ def generate_signatures_from_deseq2_params(
         if alt not in alt_params:
             continue
 
-        kind, base_gene, partners = parse_alt(alt)  # <-- you provide this helper
+        kind, base_gene, partners = parse_alt(alt)  
 
         p = alt_params[alt]
         L = sample_size(p.get("size_mean"), seed=44, fallback_size_range=fallback_size_range)
@@ -835,7 +833,7 @@ def simulate_rna_with_signatures(
             size_factors_real, n_samples, subtype=subtype, rng=seed
      )
         
-    #Build μ by finding real samples with similar alteration patterns and mixing their expression
+    #Build mean by finding real samples with similar alteration patterns and mixing their expression
     expr_bg_mu = simulate_background_from_alterations_knn(
         real_rna=rna_df_sub,
         real_alts=altertaions_real.loc[rna_df_sub.index],
@@ -855,7 +853,7 @@ def simulate_rna_with_signatures(
     # STEP 4: Generate signatures (DESeq2-parameterised if provided)
     # ----------------------------------------------------------
     
-    # Ensure binary alterations are 0/1 and aligned to simulated μ samples
+    # Ensure binary alterations are 0/1 and aligned to simulated mean samples
     alt = alteration_df.reindex(expr_bg_mu.index).fillna(0).clip(0, 1).astype(int)
     
     truth_features = list(alt.columns)
@@ -893,7 +891,7 @@ def simulate_rna_with_signatures(
     # Inject effects
     expr_effected = induce_expression_effects(
         expr_df=expr_bg_mu,
-        alteration_df=alt,                 # your binary GOF/LOF/FUSION/AMP/DEL
+        alteration_df=alt,                 # binary GOF/LOF/FUSION/AMP/DEL
         signatures=true_signatures,
         cna_gistic_df=cna_df,       # the severity matrix (-2..2)
         floor_zero=True,
@@ -910,7 +908,7 @@ def simulate_rna_with_signatures(
         if tgt in expr_effected.columns
     })
     
-    # Align dispersions to the μ matrix columns
+    # Align dispersions to the mean  matrix columns
     disp_subset = dispersions.reindex(expr_effected.columns)
 
     
