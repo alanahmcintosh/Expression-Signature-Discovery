@@ -6,7 +6,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.neighbors import NearestNeighbors
 
 # ==============================================================
-# PART 1 — PREPROCESSING + ALTERATION SIMULATION
+# ALTERATION SIMULATION
 # ==============================================================
 def estimate_cna_event_params(cna_real):
     """
@@ -34,7 +34,7 @@ def estimate_cna_event_params(cna_real):
 
     rows = []
     for g in df.columns:
-        x = df[g]  # guaranteed Series now
+        x = df[g]  
 
         p_amp = float((x > 0).mean())
         p_del = float((x < 0).mean())
@@ -440,7 +440,7 @@ def split_simulated_blocks_v2(X_sim):
         if c.endswith(("_CNA", "_AMP", "_DEL", "_AMP_LVL", "_DEL_LVL"))
     ]
 
-    # Subtype col detection (handles your current simulator output)
+    # Subtype col detection
     subtype_col = None
     for cand in ("Subtype", "SUBTYPE", "subtype"):
         if cand in X_sim.columns:
