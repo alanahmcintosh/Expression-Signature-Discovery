@@ -21,6 +21,7 @@ import re
 # 1. Default Gene Sets
 # ============================================================
 
+# Default genes - Common Oncogenes and TSGs which occur across multiple cancer types.
 DEFAULT_ONCOGENES = {
     "KRAS", "NRAS", "HRAS", "BRAF", "PIK3CA", "IDH1", "IDH2", "EGFR",
     "ERBB2", "ALK", "FGFR2", "FGFR3", "KIT", "PDGFRA", "JAK2", "MYD88",
@@ -33,6 +34,8 @@ DEFAULT_TUMOR_SUPPRESSORS = {
     "ATRX", "BRCA1", "BRCA2"
 }
 
+
+#DIfferent Mutation Types
 TRUNCATING = {
     "Nonsense_Mutation", "Frame_Shift_Del", "Frame_Shift_Ins",
     "Stop_Codon_Del", "Stop_Codon_Ins"
@@ -77,8 +80,9 @@ DISEASE_TUMOR_SUPPRESSORS = {
 # 3. Variant Classification
 # ============================================================
 
-def classify_variant(gene: str, disease: str, variant_class: str) -> str:
+def classify_variant(gene, disease, variant_class):
     """Return GOF, LOF, Unclear, or Drop classification for a single variant."""
+    # Logic for classifying variants, using the default and disease specfic genes as well as variant types.
     gene, disease = gene.upper(), disease.upper()
 
     onc = DEFAULT_ONCOGENES.union(DISEASE_ONCOGENES.get(disease, set()))
@@ -115,14 +119,14 @@ def classify_variant(gene: str, disease: str, variant_class: str) -> str:
 # ============================================================
 
 def maf_to_onehot(
-    maf_annot: pd.DataFrame,
-    sample_col: str = "Tumor_Sample_Barcode",
-    func_col: str = "Functional_Label",
-    include_uncertain: bool = True,
-    uncertain_top_k: Optional[int] = 100,
-    min_uncertain_freq: float = 0.02,
-    uncertain_labels: Optional[set] = None,
-) -> pd.DataFrame:
+    maf_annot,
+    sample_col = "Tumor_Sample_Barcode",
+    func_col = "Functional_Label",
+    include_uncertain = True,
+    uncertain_top_k = 100, # max 100 uncertain (_MUT) allowed
+    min_uncertain_freq = 0.02, #_MUT must have a min 2% freq to pass
+    uncertain_labels = None,
+):
     """
     One-hot encode a MAF-like dataframe into *_GOF, *_LOF, and *_MUT columns.
     """
@@ -179,7 +183,7 @@ def maf_to_onehot(
 # 5. CNA / Fusion / Clinical Loaders
 # ============================================================
 
-def load_cna(path: str, cna_process=True, rename: bool = False) -> pd.DataFrame:
+def load_cna(path, cna_process=True, rename= False):
     """Load and preprocess a CNA file (TCGA-style)."""
     df = pd.read_csv(path, sep=None, engine="python", index_col=0)
     if cna_process:
@@ -192,7 +196,7 @@ def load_cna(path: str, cna_process=True, rename: bool = False) -> pd.DataFrame:
     return df
 
 
-def load_fusions_raw(path: str) -> pd.DataFrame:
+def load_fusions_raw(path):
     """Load raw fusion data and one-hot encode fusions."""
     sv_df = pd.read_csv(path, sep=None, engine="python", on_bad_lines="skip")
     sv_df.columns = sv_df.columns.str.strip()
@@ -220,7 +224,7 @@ def load_fusions_raw(path: str) -> pd.DataFrame:
     return fusion_df
 
 
-def read_clinical_file(path: str) -> pd.DataFrame:
+def read_clinical_file(path):
     """Try reading a clinical file with flexible delimiters."""
     for sep_try in [None, "\t", ",", r"\s+"]:
         try:
@@ -233,7 +237,7 @@ def read_clinical_file(path: str) -> pd.DataFrame:
     raise ValueError(f"[read_clinical_file] Failed to load clinical file: {path}")
 
 
-def read_rna_file(path: str) -> pd.DataFrame:
+def read_rna_file(path):
     """Try reading a clinical file with flexible delimiters."""
     for sep_try in [None, "\t", ",", r"\s+"]:
         try:
@@ -244,7 +248,7 @@ def read_rna_file(path: str) -> pd.DataFrame:
     raise ValueError(f"[read_clinical_file] Failed to load clinical file: {path}")
 
 
-def process_subtypes(sample_info: pd.DataFrame, min_samples: int = 5) -> pd.DataFrame:
+def process_subtypes(sample_info, min_samples = 5) ->:
     """Extract and clean subtype column, filtering for sufficient sample counts."""
     if sample_info is None or sample_info.empty:
         raise ValueError("[process_subtypes] Empty clinical DataFrame.")
@@ -271,7 +275,7 @@ def process_subtypes(sample_info: pd.DataFrame, min_samples: int = 5) -> pd.Data
 # 6. Helper Functions
 # ============================================================
 
-def _to_patient_index(df: Optional[pd.DataFrame], study: Optional[str]) -> Optional[pd.DataFrame]:
+def to_patient_index(df, study):
     if df is None or not isinstance(df, pd.DataFrame) or df.empty:
         return df
     idx = df.index.astype(str).str.strip().str.upper()
@@ -282,11 +286,11 @@ def _to_patient_index(df: Optional[pd.DataFrame], study: Optional[str]) -> Optio
     return out
 
 
-def _nonempty(df: Optional[pd.DataFrame]) -> bool:
+def nonempty(df):
     return isinstance(df, pd.DataFrame) and df.shape[0] > 0 and df.shape[1] > 0
 
 
-def to_patient_id(index: pd.Series, study: Optional[str] = None) -> pd.Series:
+def to_patient_id(index, study):
     index = index.astype(str).str.strip()
     if study == "TCGA":
         return index.str.extract(r"(TCGA-\w{2}-\w{4})")[0]
@@ -295,7 +299,7 @@ def to_patient_id(index: pd.Series, study: Optional[str] = None) -> pd.Series:
     return index
 
 
-def safe_map_index(df: pd.DataFrame, study: Optional[str], name: str) -> pd.DataFrame:
+def safe_map_index(df, study, name):
     mapped = to_patient_id(df.index.to_series(), study=study)
     df = df[mapped.notna()].copy()
     df.index = mapped[mapped.notna()].str.strip().str.upper()
@@ -309,24 +313,24 @@ def safe_map_index(df: pd.DataFrame, study: Optional[str], name: str) -> pd.Data
 # ============================================================
 
 def integrate_data(
-    mut_path: str,
-    cna_path: str,
-    fusion_info_path: Optional[str],
-    patient_path: str,
-    sample_path: str,
-    rna_path: str, 
-    study: Optional[str] = None,
-    disease: Optional[str] = None,
-    cna_process: bool = True,
+    mut_path,
+    cna_path,
+    fusion_info_path:,
+    patient_path:,
+    sample_path:,
+    rna_path:, 
+    study = None,
+    disease = None,
+    cna_process = True,
     is_tcga=False,
-    cna_top_n: int = 200,
-    min_subtype_n: int = 3,
-    mut_freq_thresh: float = 0.02,
-    fusion_freq_thresh: float = 0.02,
-    rename: bool = True,
-    input_format: str = "maf",  # "maf" | "custom_tsv" | "onehot"
-    uncertain_top_k: Optional[int] = 100,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    cna_top_n = 200,
+    min_subtype_n = 3,
+    mut_freq_thresh = 0.02,
+    fusion_freq_thresh = 0.02,
+    rename = True,
+    input_format = "maf",  # "maf" | "custom_tsv" | "onehot"
+    uncertain_top_k = 100,
+):
     """Integrate mutation, CNA, fusion, and clinical data into aligned matrices."""
     # --- 1. Clinical + subtype
     clinical_start = read_clinical_file(sample_path)
@@ -350,7 +354,7 @@ def integrate_data(
 
         mut_raw = maf_to_onehot(maf, uncertain_top_k=uncertain_top_k)
         mut_raw.index = to_patient_id(mut_raw.index.to_series(), study=study).str.strip().str.upper()
-        mut_raw = _to_patient_index(mut_raw[mut_raw.index.notna()], study)
+        mut_raw = to_patient_index(mut_raw[mut_raw.index.notna()], study)
 
     # --- 3. CNA & Fusions & RNA
     cna_raw = load_cna(cna_path, cna_process, rename)
@@ -359,7 +363,7 @@ def integrate_data(
     fusion_raw = load_fusions_raw(fusion_info_path) if fusion_info_path else None
     if fusion_raw is not None:
         fusion_raw = safe_map_index(fusion_raw, study, "Fusions")
-        if not _nonempty(fusion_raw):
+        if not nonempty(fusion_raw):
             print("[INFO] No valid fusions after mapping; dropping fusion modality.")
             fusion_raw = None
     else:
@@ -377,7 +381,7 @@ def integrate_data(
 
     common = None
     for name, df in modalities.items():
-        if not _nonempty(df) and name != "clin":
+        if not nonempty(df) and name != "clin":
             print(f"[WARN] {name} modality has no data; ignored for intersection.")
             continue
         idx = df.index if isinstance(df, pd.DataFrame) else pd.Index([])
@@ -388,8 +392,8 @@ def integrate_data(
         keys = list(modalities.keys())
         for i in range(len(keys)):
             for j in range(i + 1, len(keys)):
-                ai = modalities[keys[i]].index if _nonempty(modalities[keys[i]]) else pd.Index([])
-                bj = modalities[keys[j]].index if _nonempty(modalities[keys[j]]) else pd.Index([])
+                ai = modalities[keys[i]].index if nonempty(modalities[keys[i]]) else pd.Index([])
+                bj = modalities[keys[j]].index if nonempty(modalities[keys[j]]) else pd.Index([])
                 print(f"  {keys[i]} ∩ {keys[j]}: {len(ai.intersection(bj))}")
         raise ValueError("No shared samples across modalities after ID coercion.")
 
@@ -421,7 +425,7 @@ def integrate_data(
         top_300 = (mut_df > 0).mean().sort_values(ascending=False).head(300).index
         mut_df = mut_df[top_300]
 
-    if _nonempty(fusion_df):
+    if nonempty(fusion_df):
         if fusion_df.shape[0] < 100:
             fusion_df = fusion_df.loc[:, (fusion_df > 0).sum() >= 3]
         else:
@@ -487,7 +491,7 @@ CLIN_FEATURES = {
     ]
 }
 
-def select_known_clinicals(clin_df: pd.DataFrame, cancer: str) -> pd.DataFrame:
+def select_known_clinicals(clin_df, cancer):
     """
     Subset the clinical dataframe to keep only 'known at diagnosis' variables
     relevant for the given cancer type.
@@ -530,7 +534,7 @@ def select_known_clinicals(clin_df: pd.DataFrame, cancer: str) -> pd.DataFrame:
 
 def encode_altertaions_clinical(mutation_df, cna_df, fusion_df, clinical_df, rna_df, disease):
 
-    # --- 1️⃣ Select and clean clinical variables ---
+    # --- Select and clean clinical variables ---
     clin_all_filtered = select_known_clinicals(clinical_df, disease)
     print("Kept columns:", list(clin_all_filtered.columns))
 
@@ -542,13 +546,11 @@ def encode_altertaions_clinical(mutation_df, cna_df, fusion_df, clinical_df, rna
     for col in clin_filtered.columns:
         if clin_filtered[col].dtype == object:
             clin_filtered[col] = clin_filtered[col].fillna("Unknown")
-    #     else:
-    #         clin_filtered[col] = pd.to_numeric(clin_filtered[col], errors="coerce").fillna(0.0)
 
     print(f"Kept {clin_filtered.shape[1]} columns out of {clin_all_filtered.shape[1]}")
     print(f"Remaining NaNs: {clin_filtered.isna().sum().sum()}")
 
-    # --- 2️⃣ Align all data types by sample ---
+    # ---Align all data types by sample ---
     bin_alt_real = pd.concat(
         [mutation_df, fusion_df, cna_df, clin_filtered],
         axis=1, join='inner'
@@ -568,7 +570,7 @@ def encode_altertaions_clinical(mutation_df, cna_df, fusion_df, clinical_df, rna
             X_aligned[col] = pd.to_numeric(X_aligned[col], errors="coerce")
 
 
-    # --- 3️⃣ Encode categorical variables and scale everything ---
+    # ---Encode categorical variables and scale everything ---
     non_numeric_cols = X_aligned.select_dtypes(include=["object", "category"]).columns
     numeric_cols = X_aligned.select_dtypes(exclude=["object", "category"]).columns
 
@@ -620,7 +622,7 @@ def preprocess_rna_for_simulation(rna_df, strategy="auto", user_scale=None, verb
         raise ValueError("strategy must be 'auto' or 'manual'")
 
     # Apply pseudocounting and scaling
-    #Multiplu expression and round to int
+    # Multiply expression and round to int
     rna_scaled = (rna_df * scale_factor).round().astype(int)
     
     # NB counts cannot be negative
