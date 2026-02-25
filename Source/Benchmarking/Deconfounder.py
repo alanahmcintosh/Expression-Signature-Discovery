@@ -1,8 +1,12 @@
 import numpy as np
 import pandas as pd
 import numpy.random as npr
-from scipy.sparse import coo_matrix
-from scipy import sparse, stats, linalg
+from scipy import sparse, stats
+from Lasso import *
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import RepeatedKFold
+from sklearn.linear_model import LassoCV, Lasso
+import os
 
 np.random.seed(44)
 npr.seed(44)
@@ -263,18 +267,77 @@ def predicitve_check(func, factors, holdout_portion=0.2, n_rep=100):
     #print(f'Predictive check using {factors}: p-value {overall_pval}')  # Print the overall predictive check p-value
 
 
+# OPTION 1: Use sklearn Lasso for outcome model
 def deconfounder(
-    X: pd.DataFrame,
-    Y: pd.DataFrame,
-    *,
-    # params mapped to your CD solver
-    a: float = 1.0,
-    e: float = 0.01,
-    Kfold: int = 10,
-    K: int = 100,
-    tol: float = 1e-4,
-    max_ite: int = 100,
-    seed: int = 42,
+    X,
+    Y,
+    alpha_range=np.logspace(-2, 0, 10),
+    n_splits = 3,
+    n_repeats = 1,
+    random_state = 1,
+    n_jobs = -1,
+    max_iter = 3000,
+    tol = 1e-3,
+):
+    """
+    Run LassoCV + Lasso per gene in Y.
+
+    FIX: Pre-allocate coefs columns for *all* genes so that genes with all-zero
+    coefficients still have a column. This prevents shape/index mismatch later.
+    """
+
+    if n_jobs == -1:
+        n_jobs = int(os.environ.get("SLURM_CPUS_PER_TASK", -1))
+
+    # Pre-allocate ALL gene columns using real gene names
+    coefs = pd.DataFrame(index=X.columns, columns=Y.columns, dtype=float)
+
+    models = []
+    r2_scores = []
+
+
+    cv = RepeatedKFold(n_splits=n_splits, n_repeats=n_repeats, random_state=random_state)
+
+    for gene in Y.columns:
+        y = Y[gene]
+
+        lassocv = LassoCV(
+            alphas=alpha_range,
+            cv=cv,
+            random_state=random_state,
+            n_jobs=n_jobs,
+            max_iter=max_iter,
+            tol=tol,
+        )
+        lassocv.fit(X, y)
+
+        model = Lasso(alpha=lassocv.alpha_, max_iter=max_iter, tol=tol)
+        model.fit(X, y)
+
+        models.append(model)
+
+        nz_idx = np.flatnonzero(model.coef_)
+        if nz_idx.size:
+            nz_features = X.columns[nz_idx]
+            coefs.loc[nz_features, gene] = model.coef_[nz_idx]
+
+        r2_scores.append(model.score(X, y))
+
+    coefs = coefs.copy()  
+    return coefs, models, r2_scores
+
+
+#OPTION 2: Use built lasso for outcome model
+def lasso(
+    X,
+    Y,
+    a = 1.0,
+    e = 0.01,
+    Kfold = 10,
+    K = 100,
+    tol = 1e-4,
+    max_ite = 100,
+    seed = 44,
 ):
     """
     Wrap the coordinate-descent multi-output Lasso to mimic the old LassoCV API.
@@ -295,14 +358,14 @@ def deconfounder(
     # Means needed to reconstruct predictions in original (un-normalized) space
     y_means = Y_np.mean(axis=0, keepdims=True)  # shape (1, q)
 
-    # Recompute X normalization to match your solver's preprocessing
+    # Recompute X normalization to match solver's preprocessing
     # (must mirror: S = sqrt( sum(x^2)/n - mean(x)^2 ))
     M = X_np.mean(axis=0, keepdims=True)  # (1, p)
     S2 = (np.sum(X_np**2, axis=0, keepdims=True) / n) - (M**2)
     # Guard against numerical zeros/negatives
     S = np.sqrt(np.where(S2 <= 0.0, 1.0, S2))  # (1, p)
 
-    # Run your cross-validation to get the best coefficients per output
+    # Run cross-validation to get the best coefficients per output
     B_best, MSE, B_full = cross_validation(
         X_np, Y_np,
         a=a, e=e, Kfold=Kfold, K=K, tol=tol, max_ite=max_ite, seed=seed
@@ -347,6 +410,7 @@ def deconfounder(
         model = _CDModel(B_mat[:, j], M, S, y_means[0, j])
         models.append(model)
         r2_scores.append(model.score(X_np, Y_np[:, j]))
+    coefs = coefs.copy()
 
     return coefs, models, r2_scores
 
@@ -365,10 +429,14 @@ def choose_latent_dim_ppca(X, k_range=range(2, 99), holdout_portion=0.2, pval_cu
     # If none satisfy the cutoff, return max tested value
     return k_range[-1]
 
-def precompute_global_results(X, Y):
+
+def compute_deconfounder(X, Y):
     """
-    Run the full Deconfounder pipeline on input matrices X and Y.
-    Adds inferred latent variables, normalizes expression, runs Lasso, and returns signatures.
+    Full Deconfounder pipeline:
+    - fit PPCA on X to infer latent factors
+    - augment X with latent factors
+    - normalize + log + scale Y (keeping gene names!)
+    - run LassoCV/Lasso per gene to get coefficients
     """
     k = choose_latent_dim_ppca(X)
     print(f"Selected latent dimension: {k}")
@@ -380,19 +448,32 @@ def precompute_global_results(X, Y):
     _ = m_ppca.generate(1)
     _ = predicitve_check(m_ppca, k)
 
-    latent_df = pd.DataFrame(m_ppca.z_mu.T, index=X.index, columns=[f"latent_{i}" for i in range(k)])
+    latent_df = pd.DataFrame(
+        m_ppca.z_mu.T,
+        index=X.index,
+        columns=[f"latent_{i}" for i in range(k)]
+    )
     augmented_X = pd.concat([X, latent_df], axis=1).astype(float)
     augmented_X.columns = augmented_X.columns.astype(str)
 
     # Normalize gene expression using library size normalization + log transform
     size_factors = 10000 / Y.sum(axis=1)
     Y_norm = np.log1p(Y.mul(size_factors, axis=0))
-    Y_scaled = pd.DataFrame(StandardScaler().fit_transform(Y_norm), index=Y.index)
-    Y_scaled.columns = [f'Expression_Gene_{i}' for i in range(Y.shape[1])]
-    causal_signatures = {}
-    coefs, models, R2 = deconfounder(augmented_X, Y_scaled)
-    coefs_tr = coefs.T.set_index(Y.columns)
-    causal_signatures['Deconfounder'] = coefs_tr
+
+    # KEEP gene names; critical for alignment
+    Y_scaled = pd.DataFrame(
+        StandardScaler().fit_transform(Y_norm),
+        index=Y.index,
+        columns=Y.columns
+    )
+
+    coefs, models, R2 = deconfounder(augmented_X, Y_scaled) # uses OPTION1, but can change to lasso() for option2
+
+    # coefs: rows = features, cols = genes
+    # transpose to: rows = genes, cols = features
+    coefs_tr = coefs.T  # index already == gene names because deconfounder() pre-allocates columns=Y.columns
+
+    causal_signatures = {"Deconfounder": coefs_tr}
 
     print("Global precomputation completed.")
     return causal_signatures
