@@ -73,6 +73,20 @@ def build_targets_shared(
     """
 
     rng = np.random.default_rng(seed)
+
+        # NEW: infer gene_set/genes if missing
+    if gene_set is None:
+        if genes is not None:
+            gene_set = set(genes)
+        else:
+            # fall back to ref_targets as the available universe
+            gene_set = set(ref_targets)
+
+    if genes is None:
+        genes = list(gene_set)
+
+    forced = [base_gene] if base_gene in gene_set else []
+    
     forced = [base_gene] if base_gene in gene_set else []
     remaining_slots = max(0, L - len(forced))
 
@@ -571,12 +585,18 @@ def generate_signatures_from_deseq2_params(
             if share_amp_with_gof and alt.endswith("_AMP"):
                 ref_key = f"{base_gene}_GOF"
                 if ref_key in signatures:
-                    targets = build_targets_shared(base_gene, L, signatures[ref_key]["targets"], share_frac)
+                    targets = build_targets_shared(
+                                base_gene, L, signatures[ref_key]["targets"], share_frac,
+                                seed=seed, gene_set=set(genes), genes=genes
+                            )
 
             elif share_del_with_lof and alt.endswith("_DEL"):
                 ref_key = f"{base_gene}_LOF"
                 if ref_key in signatures:
-                    targets = build_targets_shared(base_gene, L, signatures[ref_key]["targets"], share_frac, gene_set=gene_set, genes=genes)
+                    targets = build_targets_shared(
+                                base_gene, L, signatures[ref_key]["targets"], share_frac,
+                                seed=seed, gene_set=set(genes), genes=genes
+                            )
 
         if targets is None:
             targets = build_targets_default(base_gene, L, gene_set=gene_set, genes=genes)
