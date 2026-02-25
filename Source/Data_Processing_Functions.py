@@ -248,7 +248,7 @@ def read_rna_file(path):
     raise ValueError(f"[read_clinical_file] Failed to load clinical file: {path}")
 
 
-def process_subtypes(sample_info, min_samples = 5) ->:
+def process_subtypes(sample_info, min_samples = 5):
     """Extract and clean subtype column, filtering for sufficient sample counts."""
     if sample_info is None or sample_info.empty:
         raise ValueError("[process_subtypes] Empty clinical DataFrame.")
@@ -303,7 +303,7 @@ def safe_map_index(df, study, name):
     mapped = to_patient_id(df.index.to_series(), study=study)
     df = df[mapped.notna()].copy()
     df.index = mapped[mapped.notna()].str.strip().str.upper()
-    df = _to_patient_index(df, study)
+    df = to_patient_index(df, study)
     print(f"[INFO] {name}: mapped {len(df)} samples")
     return df
 
@@ -315,10 +315,10 @@ def safe_map_index(df, study, name):
 def integrate_data(
     mut_path,
     cna_path,
-    fusion_info_path:,
-    patient_path:,
-    sample_path:,
-    rna_path:, 
+    fusion_info_path,
+    patient_path,
+    sample_path,
+    rna_path, 
     study = None,
     disease = None,
     cna_process = True,
