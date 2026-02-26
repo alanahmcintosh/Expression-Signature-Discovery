@@ -1,44 +1,18 @@
-# ========================
-# Libraries
-# ========================
 import numpy as np
 import pandas as pd
 
-# Machine learning models
-from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
-from sklearn.linear_model import LogisticRegressionCV, LogisticRegression, LassoCV, ElasticNetCV, Ridge
-from sklearn.svm import SVC, SVR
-from sklearn.svm import LinearSVC
+from sklearn.model_selection import RepeatedKFold
+from sklearn.linear_model import LassoCV, Lasso, ElasticNetCV, ElasticNet, RidgeCV
+from sklearn.svm import LinearSVR
+from sklearn.ensemble import RandomForestRegressor
 
-
-# Dimensionality reduction / clustering
-from sklearn.decomposition import NMF
-from sklearn.cluster import KMeans
-from sklearn.metrics import silhouette_score, adjusted_rand_score, normalized_mutual_info_score
 from sklearn.preprocessing import StandardScaler
 
-# Model evaluation
-from sklearn.model_selection import RepeatedKFold
-
-# Statistics
-from scipy.stats import chi2_contingency, fisher_exact, ttest_ind, mannwhitneyu
-from statsmodels.stats.multitest import multipletests
-
-# Hierarchical clustering
-from scipy.cluster.hierarchy import linkage, cophenet
-from scipy.spatial.distance import squareform
-
-# RNA-seq differential expression
 from pydeseq2.dds import DeseqDataSet
 from pydeseq2.ds import DeseqStats
 from pydeseq2.default_inference import DefaultInference
 
-
-from pandas.api.types import CategoricalDtype
-
-# Custom functions
 from Deconfounder import *
-
 
 
 
@@ -54,7 +28,6 @@ def select_features_elbow(feature_names, weights, tol=1e-8):
     - Finds the 'knee' of the sorted curve (rank vs |weight|).
     - Returns all features up to the knee index.
 
-    No min/max, no manual thresholds.
     """
     weights = np.asarray(weights).ravel()
     abs_w = np.abs(weights)
@@ -100,134 +73,246 @@ def select_features_elbow(feature_names, weights, tol=1e-8):
     return names_sorted[: knee_idx + 1].tolist()
 
 
-def normalize_counts_log_cpm(Y_counts, libsize_target=1e4):
+def normalize_counts_log_cpm(Y_counts, pseudo=1.0, zscore=True):
     """
-    CPM-like scaling + log1p, then z-score per gene.
-    Returns a DataFrame with the same index/columns (minus any all-zero samples).
+    DESeq2-style size-factor normalization (median-of-ratios),
+    then log transform and (optionally) z-score per gene.
 
-    Steps:
-    1. Compute library size per sample.
-    2. Scale counts so total = libsize_target (CPM-like).
-    3. Log1p transform for variance stabilization.
-    4. Z-score per gene so ML models behave well.
+    Notes:
+    - If samples differ only by depth and have identical composition,
+      normalized expression will be identical across samples.
     """
+
+    Y = Y_counts.copy()
+
     # Total counts per sample
-    s = Y_counts.sum(axis=1)
+    s = Y.sum(axis=1)
 
-    # Drop all-zero samples (DESeq2 would drop them too)
+    # Drop all-zero samples
     keep = s > 0
-    Y_counts = Y_counts.loc[keep]
-    s = s[keep]
+    Y = Y.loc[keep]
+    if Y.shape[0] == 0:
+        return Y  # empty
 
-    # Scale factor to reach target library size
-    p = libsize_target / s
-    Y_norm = Y_counts.mul(p, axis=0)
+    # -----
+    # Median-of-ratios size factors
+    # -----
+    # Geometric mean per gene (ignoring zeros by treating them as NaN in logs)
+    Y_float = Y.astype(float)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        logY = np.log(Y_float)
+    logY[~np.isfinite(logY)] = np.nan  # log(0) -> nan
+    gmean_log = np.nanmean(logY.values, axis=0)  # per gene
+    gmean = np.exp(gmean_log)
+    # genes with gmean==0 or nan are unusable
+    valid_genes = np.isfinite(gmean) & (gmean > 0)
 
-    # Log1p transform
-    Y_norm = np.log1p(Y_norm)
+    if valid_genes.sum() == 0:
+        # No usable genes to compute size factors
+        # Fall back to simple library-size scaling (rare edge case)
+        size_factors = s / np.median(s)
+    else:
+        gmean_valid = gmean[valid_genes]
+        ratios = Y_float.iloc[:, valid_genes] / gmean_valid  # sample x gene
+        # ignore zeros in ratios (where count==0)
+        ratios = ratios.mask(~np.isfinite(ratios) | (ratios <= 0), np.nan)
+        size_factors = pd.Series(np.nanmedian(ratios.values, axis=1), index=Y.index)
 
-    # Z-score per gene
+        # If a sample has all zeros for valid genes, median becomes nan; fall back
+        if size_factors.isna().any():
+            fallback = (s / np.median(s)).astype(float)
+            size_factors = size_factors.fillna(fallback)
+
+    # Normalize counts
+    Y_norm = Y.div(size_factors, axis=0)
+
+    # Log transform
+    Y_norm = np.log1p(Y_norm + pseudo - 1.0)  # pseudo=1.0 -> log1p
+
+    if not zscore:
+        return Y_norm
+
+    # Z-score per gene (safe for 0-variance genes: sklearn outputs 0s)
     Z = pd.DataFrame(
         StandardScaler(with_mean=True, with_std=True).fit_transform(Y_norm),
         index=Y_norm.index,
         columns=Y_norm.columns,
     )
-
     return Z
 
 
-'''
-For Binary Features (Mutations/Fusions) use classification algorithims
-'''
+def align_XY(X, Y):
+    common = X.index.intersection(Y.index)
+    X2 = X.loc[common]
+    Y2 = Y.loc[common]
+    return X2, Y2
 
-def get_lasso_class_signature(X, y, tol=1e-6, cv=3, Cs=10, max_iter=3000, n_jobs=4):
-    if len(np.unique(y.dropna())) < 2:
+##################################
+# 2. Supervised Methods
+##################################
+
+
+def fit_alt_to_expr_weights_lasso(
+    X_alt, Y_expr,
+    alpha_range=np.logspace(-3, 0, 25),
+    n_splits=3, n_repeats=1, random_state=44,
+    n_jobs=8, max_iter=5000, tol=1e-3,
+):
+    """
+    Per-gene LassoCV on: expr_gene ~ X_alt
+    Returns weights: predictors x genes (NaN where coef==0).
+    """
+    X, Y = align_XY(X_alt, Y_expr)
+    cv = RepeatedKFold(n_splits=n_splits, n_repeats=n_repeats, random_state=random_state)
+
+    W = pd.DataFrame(index=X.columns, columns=Y.columns, dtype=float)
+
+    for gene in Y.columns:
+        y = Y[gene].values
+
+        lcv = LassoCV(
+            alphas=alpha_range, cv=cv, random_state=random_state,
+            n_jobs=n_jobs, max_iter=max_iter, tol=tol
+        )
+        lcv.fit(X, y)
+
+        model = Lasso(alpha=lcv.alpha_, max_iter=max_iter, tol=tol, random_state=random_state)
+        model.fit(X, y)
+
+        coef = model.coef_
+        nz = np.flatnonzero(coef)
+        if nz.size:
+            W.iloc[nz, W.columns.get_loc(gene)] = coef[nz]
+
+    return W
+
+
+def fit_alt_to_expr_weights_elasticnet(
+    X_alt, Y_expr,
+    alpha_range=np.logspace(-3, 0, 25), l1_ratios=(0.5,),
+    n_splits=3, n_repeats=1, random_state=44,
+    n_jobs=8, max_iter=5000, tol=1e-3,
+):
+    """
+    Per-gene ElasticNetCV on: expr_gene ~ X_alt
+    Returns weights: predictors x genes (NaN where coef==0).
+    """
+    X, Y = align_XY(X_alt, Y_expr)
+    cv = RepeatedKFold(n_splits=n_splits, n_repeats=n_repeats, random_state=random_state)
+
+    W = pd.DataFrame(index=X.columns, columns=Y.columns, dtype=float)
+
+    for gene in Y.columns:
+        y = Y[gene].values
+
+        encv = ElasticNetCV(
+            alphas=alpha_range, l1_ratio=list(l1_ratios),
+            cv=cv, random_state=random_state, n_jobs=n_jobs,
+            max_iter=max_iter, tol=tol
+        )
+        encv.fit(X, y)
+
+        model = ElasticNet(
+            alpha=encv.alpha_, l1_ratio=encv.l1_ratio_,
+            max_iter=max_iter, tol=tol, random_state=random_state
+        )
+        model.fit(X, y)
+
+        coef = model.coef_
+        nz = np.flatnonzero(coef)
+        if nz.size:
+            W.iloc[nz, W.columns.get_loc(gene)] = coef[nz]
+
+    return W
+
+
+def fit_alt_to_expr_weights_ridge(X_alt, Y_expr, alphas=np.logspace(-3, 3, 13)):
+    """
+    RidgeCV multi-output regression: Y_expr ~ X_alt (fits ALL genes at once, fast).
+    Returns dense weights: predictors x genes.
+    """
+    X, Y = align_XY(X_alt, Y_expr)
+    rcv = RidgeCV(alphas=alphas)
+    rcv.fit(X.values, Y.values)
+    return pd.DataFrame(rcv.coef_.T, index=X.columns, columns=Y.columns, dtype=float)
+
+
+def fit_alt_to_expr_weights_svm(X_alt, Y_expr, C=1.0, epsilon=0.1, max_iter=5000, tol=1e-3, random_state=44):
+    """
+    LinearSVR per gene: expr_gene ~ X_alt
+    Returns weights: predictors x genes (NaN where coef==0).
+    """
+    X, Y = align_XY(X_alt, Y_expr)
+    W = pd.DataFrame(index=X.columns, columns=Y.columns, dtype=float)
+
+    for gene in Y.columns:
+        y = Y[gene].values
+        svr = LinearSVR(C=C, epsilon=epsilon, max_iter=max_iter, tol=tol, random_state=random_state)
+        svr.fit(X.values, y)
+        coef = svr.coef_
+        nz = np.flatnonzero(coef)
+        if nz.size:
+            W.iloc[nz, W.columns.get_loc(gene)] = coef[nz]
+
+    return W
+
+
+def fit_alt_to_expr_importances_rf(X_alt, Y_expr, n_estimators=200, max_depth=12, random_state=44, n_jobs=8):
+    """
+    RF regressor per gene: expr_gene ~ X_alt
+    Returns importances: predictors x genes (dense).
+    """
+    X, Y = align_XY(X_alt, Y_expr)
+    W = pd.DataFrame(index=X.columns, columns=Y.columns, dtype=float)
+
+    for gene in Y.columns:
+        y = Y[gene].values
+        rf = RandomForestRegressor(
+            n_estimators=n_estimators, max_depth=max_depth,
+            random_state=random_state, n_jobs=n_jobs
+        )
+        rf.fit(X.values, y)
+        W[gene] = rf.feature_importances_
+
+    return W
+
+###############################
+# 3. Get signatures from methods
+###############################
+
+
+def signature_from_weights_for_alt(
+    W,
+    alt,
+    mode = "nonzero",   # "nonzero" or "elbow"
+    coef_tol = 1e-6,
+    elbow_tol = 1e-8,
+):
+    """
+    W: predictors x genes (weights or importances)
+    alt: predictor name (e.g., TP53_LOF, MYC_AMP)
+    mode:
+      - "nonzero": return genes with |weight| > coef_tol (good for Lasso/ElasticNet)
+      - "elbow": use select_features_elbow on |weights| (good for Ridge/RF/SVR)
+    """
+    if alt not in W.index:
         return []
 
-    model = LogisticRegressionCV(
-        penalty="l1",
-        solver="saga",              # faster/more scalable than liblinear for many features
-        random_state=44,
-        cv=cv,
-        Cs=Cs,
-        max_iter=max_iter,
-        n_jobs=n_jobs
-    )
-    model.fit(X, y)
-    coefs = model.coef_[0]
-    return X.columns[np.abs(coefs) > tol].tolist()
+    row = W.loc[alt].copy()
+    row = row.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    if mode == "nonzero":
+        return row.index[np.abs(row.values) > coef_tol].tolist()
+
+    if mode == "elbow":
+        return select_features_elbow(row.index, row.values, tol=elbow_tol)
+
+    raise ValueError("mode must be 'nonzero' or 'elbow'")
 
 
-def get_elasticnet_class_signature(X, y, tol=1e-6, cv=3, Cs=10, max_iter=3000, n_jobs=4):
-    if len(np.unique(y.dropna())) < 2:
-        return []
-
-    model = LogisticRegressionCV(
-        penalty="elasticnet",
-        solver="saga",
-        l1_ratios=[0.5],
-        random_state=44,
-        cv=cv,
-        Cs=Cs,
-        max_iter=max_iter,
-        n_jobs=n_jobs
-    )
-    model.fit(X, y)
-    coefs = model.coef_[0]
-    return X.columns[np.abs(coefs) > tol].tolist()
-
-
-def get_svm_class_signature(X, y):
-    if len(np.unique(y.dropna())) < 2:
-        return []
-
-    model = LinearSVC(
-        random_state=44,
-        max_iter=5000,
-        tol=1e-3,
-    )
-    model.fit(X, y)
-
-    coefs = model.coef_[0]
-    return select_features_elbow(X.columns, coefs)
-
-
-
-def get_ridgereg_class_signature(X, y, tol=1e-3):
-    """Logistic regression with L2: elbow on |weights|."""
-    if len(np.unique(y.dropna())) < 2:
-        return []
-
-    model = LogisticRegression(
-        penalty="l2",
-        solver="saga",
-        random_state=44,
-        max_iter=3000,
-        tol=tol
-    )
-
-    model.fit(X, y)
-    coefs = model.coef_[0]
-    return select_features_elbow(X.columns, coefs)
-
-
-def get_rf_class_signature(X, y):
-    """Random forest classifier: elbow on feature_importances."""
-    if len(np.unique(y.dropna())) < 2:
-        return []
-
-    model = RandomForestClassifier(
-        random_state=44,
-        n_estimators=200,
-        max_depth=12,
-    )
-    model.fit(X, y)
-    importances = model.feature_importances_
-    return select_features_elbow(X.columns, importances)
-
-'''
-DESEQ2
-'''
+###############################
+# 4. DESEQ2
+###############################
 
 def get_deseq2_signature_binary(
     X, Y, gof,
@@ -256,15 +341,13 @@ def get_deseq2_signature_binary(
     if (0 not in vc) or (1 not in vc) or vc[0] < min_group_n or vc[1] < min_group_n:
         return []
 
-    # metadata table (v0.4.x uses metadata=)
+    # metadata table 
     metadata = pd.DataFrame(index=counts.index)
     metadata["condition"] = x.astype(str)
 
     # Make it categorical and set reference level explicitly
     metadata["condition"] = pd.Categorical(metadata["condition"], categories=["0", "1"])
 
-    # v0.4.12 API: design_factors, ref_level
-    # (DefaultInference exists in 0.4.12, but inference= is optional here)
     dds = DeseqDataSet(
         counts=counts,
         metadata=metadata,
@@ -288,10 +371,10 @@ def get_deseq2_signature_binary(
 
 
 
+#####################################
+# 5. Causal (Deconfounder) Signature
+####################################
 
-'''
-Causal (Deconfounder) Signature
-'''
 def get_deconfounder_signature(gof, global_results):
     coefs_tr = global_results['Deconfounder']
     if isinstance(gof, list):
@@ -299,18 +382,36 @@ def get_deconfounder_signature(gof, global_results):
     gene_signature = coefs_tr[[gof]].dropna()
     return list(gene_signature.index)
 
-def class_supervised_signatures(Y_norm_df, x):
+
+###############################
+# 7. Wrappers
+###############################
+
+def class_supervised_signatures(W_dict, gof):
     """
-    Supervised signatures for binary alterations (mutations, fusions, binarised CNAs).
-    X = normalized RNA, y = binary alteration status.
+    Extract signatures for one alteration from precomputed weights/importances.
     """
     signatures = {}
-    signatures['Random Forest']       = get_rf_class_signature(Y_norm_df, x)
-    signatures['Lasso']               = get_lasso_class_signature(Y_norm_df, x)
-    signatures['ElasticNet']          = get_elasticnet_class_signature(Y_norm_df, x)
-    signatures['SVM']                 = get_svm_class_signature(Y_norm_df, x)
-    signatures['Ridge']               = get_ridgereg_class_signature(Y_norm_df, x)
+    signatures["Lasso"] = signature_from_weights_for_alt(W_dict["Lasso"], gof, mode="nonzero")
+    signatures["ElasticNet"] = signature_from_weights_for_alt(W_dict["ElasticNet"], gof, mode="nonzero")
+    signatures["Ridge"] = signature_from_weights_for_alt(W_dict["Ridge"], gof, mode="elbow")
+    signatures["SVM"] = signature_from_weights_for_alt(W_dict["SVM"], gof, mode="elbow") 
+    signatures["Random Forest"] = signature_from_weights_for_alt(W_dict["Random Forest"], gof, mode="elbow")
     return signatures
+
+
+def precompute_supervised_weights(X_alt_df, Y_norm_df):
+    """
+    Fit effect models ONCE: expr ~ alterations.
+    Returns dict of method -> weights matrix (predictors x genes).
+    """
+    W = {}
+    W["Lasso"]         = fit_alt_to_expr_weights_lasso(X_alt_df, Y_norm_df)
+    W["ElasticNet"]    = fit_alt_to_expr_weights_elasticnet(X_alt_df, Y_norm_df)
+    W["Ridge"]         = fit_alt_to_expr_weights_ridge(X_alt_df, Y_norm_df)
+    W["SVM"]           = fit_alt_to_expr_weights_svm(X_alt_df, Y_norm_df)
+    W["Random Forest"] = fit_alt_to_expr_importances_rf(X_alt_df, Y_norm_df)
+    return W
 
 
 def create_supervised_signatures(
@@ -318,84 +419,56 @@ def create_supervised_signatures(
     Y,
     gof,
     global_results=None,
-    Y_norm_df=None,
+    W_dict=None,
     min_unique_x=2,
     min_std_x=1e-8,
-    min_group_n=1,   # NEW: prevent tiny groups
+    min_group_n=1,
 ):
-    """
-    Binary predictor signatures only (mut/fusion/AMP/DEL).
-
-    - ML models use normalized RNA
-    - DESeq2 uses raw counts
-    """
-
     # ---- align samples once ----
-    common_idx = X.index.intersection(Y.index)
-    X = X.loc[common_idx]
-    Y = Y.loc[common_idx]
+    common = X.index.intersection(Y.index)
+    X = X.loc[common]
+    Y = Y.loc[common]
 
     if gof not in X.columns:
         raise KeyError(f"{gof} not found in X columns.")
 
-    # predictor
     x = pd.to_numeric(X[gof], errors="coerce")
-
-    # ---- drop NaNs consistently ----
     valid_idx = x.dropna().index
-    x = x.loc[valid_idx]
+    x = x.loc[valid_idx].astype(int)
+
     Y_sub = Y.loc[valid_idx]
 
-    # ---- enforce 0/1 (important for robustness) ----
-    # if x is already 0/1 this is a no-op; if it’s float, it will coerce cleanly
-    x = x.astype(int)
-
-    # ---- guard: constant / near-constant predictor ----
     nunq = x.nunique(dropna=True)
     std = float(x.std())
     if nunq < min_unique_x or not (std > min_std_x):
         return {"SKIPPED": f"{gof}: predictor constant/low-var (n_unique={nunq}, std={std})"}
 
-    # ---- group-size guard ----
     vc = x.value_counts()
     if (0 not in vc) or (1 not in vc) or (vc[0] < min_group_n) or (vc[1] < min_group_n):
         return {"SKIPPED": f"{gof}: insufficient group sizes {vc.to_dict()} (min_group_n={min_group_n})"}
 
-    # ---- normalize RNA for ML models (NOT for DESeq2) ----
-    if Y_norm_df is None:
-        Y_norm_df = normalize_counts_log_cpm(Y)
-
-    common2 = x.index.intersection(Y_norm_df.index)
-    x_ml = x.loc[common2]
-    Y_ml = Y_norm_df.loc[common2]
-
     signatures = {}
 
-    # ---- classification ONLY ----
-    base_sigs = class_supervised_signatures(Y_ml, x_ml)
-    signatures.update(dict(base_sigs))
+    # ---- effect-style ML models: extract from precomputed weights ----
+    if W_dict is not None:
+        signatures.update(class_supervised_signatures(W_dict, gof))
+
 
     # ---- Deconfounder ----
     if global_results is not None:
-        try:
-            signatures["Deconfounder"] = get_deconfounder_signature(gof, global_results)
-        except Exception as e:
-            signatures["Deconfounder_ERROR"] = repr(e)
+        signatures["Deconfounder"] = get_deconfounder_signature(gof, global_results)
 
+    
     # ---- DESeq2 ----
     try:
         if (Y_sub < 0).any().any():
             raise ValueError(f"{gof}: Y contains negative values; DESeq2 requires non-negative counts.")
 
-        # NEW: pass only the needed design column
         X_design = pd.DataFrame({gof: x}, index=x.index)
-
         signatures["DESeq2"] = get_deseq2_signature_binary(X_design, Y_sub, gof)
 
     except Exception as e:
         signatures["DESeq2_ERROR"] = repr(e)
 
     return signatures
-
-
 
