@@ -206,7 +206,7 @@ def read_dataset_for_evaluation(
     truth = bundle["truth"]            # {alt: {"targets": set, "effects": dict, ...}}
     all_genes = bundle["all_genes"]    # set[str] universe for FP/FN definition
     methods = bundle["methods"]        # {method: {alt: [genes...]}} (already normalized in bundle)
-    truth_alts = list(truth.keys())    # preserve ordering if you care
+    truth_alts = list(truth.keys())    # preserve ordering
 
     return {
         "dataset": dataset,
@@ -410,9 +410,6 @@ RUN ALL
 """
 
 def evaluate_dataset(dataset: str):
-    """
-    Backwards-compatible wrapper matching your original API.
-    """
     ds = read_dataset_for_evaluation(dataset, RESULTS_DIR)
     return evaluate_dataset_outputs(
         dataset=ds["dataset"],
