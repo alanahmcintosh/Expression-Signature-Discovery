@@ -17,7 +17,7 @@ PathLike = Union[str, Path]
 # FUSIONS
 # =============================================================================
 
-def read_fusions_file(path):
+def read_fusions_raw(path):
     """
     Load raw fusion file and return one-hot encoded fusion matrix.
 
