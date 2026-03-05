@@ -61,9 +61,6 @@ def simulate_X(
         sizes.iloc[-1] += n_samples - sizes.sum()  # fix rounding mismatch
 
     blocks = []
-Exports:
-- simulate_X_hybrid_ratioCNA: subtype-aware simulator for mut/fusion/cna/clinical
-- split_simulated_blocks_v2: split combined simulated matrix back into blocks
 
     for s, n in zip(sizes.index, sizes):
         n = int(n)
@@ -96,7 +93,7 @@ Exports:
         # Vary the seed per subtype block to avoid identical RNG streams
         block_seed = int(rng.integers(0, 2**31 - 1))
 
-        sim_df = sample_from_neighbors_ratioCNA(
+        sim_df = sample_from_neighbors(
             scaled_df=scaled,
             unscaled_dfs=unscaled,
             n_samples=n,
@@ -134,6 +131,50 @@ def split_simulated_blocks(X_sim):
             pd.DataFrame(),
             pd.Series(dtype="object"),
         )
+
+    X_sim = X_sim.copy()
+    X_sim.columns = X_sim.columns.astype(str)
+
+    mut_cols = [c for c in X_sim.columns if c.endswith(("_MUT", "_GOF", "_LOF"))]
+    fusion_cols = [c for c in X_sim.columns if ("_FUSION" in c or "_FUS" in c)]
+
+    cna_cols = [
+        c
+        for c in X_sim.columns
+        if c.endswith(("_CNA", "_AMP", "_DEL", "_AMP_LVL", "_DEL_LVL"))
+    ]
+
+    # Subtype col detection
+    subtype_col = None
+    for cand in ("Subtype", "SUBTYPE", "subtype"):
+        if cand in X_sim.columns:
+            subtype_col = cand
+            break
+
+    exclude = set(mut_cols + fusion_cols + cna_cols + ([subtype_col] if subtype_col else []))
+    clinical_cols = [c for c in X_sim.columns if c not in exclude]
+
+    mut_sim = X_sim[mut_cols] if mut_cols else pd.DataFrame(index=X_sim.index)
+    fusion_sim = X_sim[fusion_cols] if fusion_cols else pd.DataFrame(index=X_sim.index)
+    cna_sim = X_sim[cna_cols] if cna_cols else pd.DataFrame(index=X_sim.index)
+    clin_sim = (
+        X_sim[clinical_cols] if clinical_cols else pd.DataFrame(index=X_sim.index, dtype="object")
+    )
+
+    if subtype_col:
+        subtype_sim = X_sim[subtype_col]
+    else:
+        subtype_sim = pd.Series(index=X_sim.index, dtype="object")
+
+    print(f" Mutations: {mut_sim.shape[1]} features")
+    print(f" Fusions:   {fusion_sim.shape[1]} features")
+    print(f" CNAs:      {cna_sim.shape[1]} features")
+    print(f" Clinical:  {clin_sim.shape[1]} features")
+    if subtype_col:
+        print(f" Subtypes:  {subtype_sim.nunique()} unique")
+
+    return mut_sim, fusion_sim, cna_sim, clin_sim, subtype_sim
+
 
     X_sim = X_sim.copy()
     X_sim.columns = X_sim.columns.astype(str)
