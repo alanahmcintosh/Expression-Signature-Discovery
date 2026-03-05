@@ -1,10 +1,16 @@
-from .simulate_alterations import simulate_X, split_simulated_blocks
+# src/Benchmark_Sigs/simulate/alterations/__init__.py
+from .scaling import preprocess_X_weighted, robust_scale_with_floor
 from .cna_params import estimate_cna_event_params
+from .knn_sampler import sample_from_neighbors
+from .simulate_alterations import simulate_X, split_simulated_blocks
 from .cna_utils import gistic_to_amp_del_binary
 
 __all__ = [
+    "preprocess_X_weighted",
+    "robust_scale_with_floor",
+    "estimate_cna_event_params",
+    "sample_from_neighbors",
     "simulate_X",
     "split_simulated_blocks",
-    "estimate_cna_event_params",
     "gistic_to_amp_del_binary",
 ]
