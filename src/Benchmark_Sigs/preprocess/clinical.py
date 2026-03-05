@@ -221,6 +221,10 @@ def encode_alterations_clinical(
     print("Final Xs shape:", Xs.shape)
 
     return Xs
+
+
+
+    return Xs
     print("Final Xs shape:", Xs.shape)
     
     return Xs
