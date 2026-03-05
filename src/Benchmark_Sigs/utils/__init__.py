@@ -1,5 +1,9 @@
-__all__ = [
-    "__version__",
-]
+# src/Benchmark_Sigs/utils/__init__.py
+from .checks import nonempty, to_patient_id, to_patient_index, safe_map_index
 
-__version__ = "0.1.0"
+__all__ = [
+    "nonempty",
+    "to_patient_id",
+    "to_patient_index",
+    "safe_map_index",
+]
