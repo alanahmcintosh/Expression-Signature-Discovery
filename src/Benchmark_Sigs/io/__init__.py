@@ -1,5 +1,14 @@
-__all__ = [
-    "__version__",
-]
+# src/Benchmark_Sigs/io/__init__.py
+from .readers import (
+    read_cna_file,
+    read_fusions_file,
+    read_clinical_file,
+    read_rna_file,
+)
 
-__version__ = "0.1.0"
+__all__ = [
+    "read_cna_file",
+    "read_fusions_file",
+    "read_clinical_file",
+    "read_rna_file",
+]
