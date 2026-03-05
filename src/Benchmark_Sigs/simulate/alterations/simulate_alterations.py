@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 
 from benchmark_sigs.simulate.alterations.scaling import preprocess_X_weighted
-from benchmark_sigs.simulate.alterations.knn_sampler import sample_from_neighbors_ratioCNA
+from benchmark_sigs.simulate.alterations.knn_sampler import sample_from_neighbors
 
 
 def simulate_X(
