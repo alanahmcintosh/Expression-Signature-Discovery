@@ -28,10 +28,6 @@ def normalize_counts_log_cpm(
     pd.DataFrame
         Normalized (and optionally z-scored) expression matrix.
 
-    Notes
-    -----
-    - If samples differ only by depth and have identical composition,
-      normalized expression will be identical across samples.
     """
 
     if not isinstance(Y_counts, pd.DataFrame):
