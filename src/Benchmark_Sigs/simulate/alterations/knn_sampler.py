@@ -11,7 +11,7 @@ from sklearn.neighbors import NearestNeighbors
 from benchmark_sigs.simulate.alterations.cna_params import estimate_cna_event_params
 
 
-def sample_from_neighbors_ratioCNA(
+def sample_from_neighbors(
     scaled_df,
     unscaled_dfs,
     n_samples,
