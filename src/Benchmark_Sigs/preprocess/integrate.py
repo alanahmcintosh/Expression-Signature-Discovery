@@ -21,7 +21,7 @@ import pandas as pd
 from benchmark_sigs.io.readers import read_clinical_file, read_rna_file, read_cna_file
 from benchmark_sigs.preprocess.clinical import process_subtypes
 from benchmark_sigs.preprocess.mutations import classify_variant, maf_to_onehot
-from benchmark_sigs.preprocess.fusions import read_fusions_file as load_fusions_raw 
+from benchmark_sigs.preprocess.fusions import read_fusions_raw
 from benchmark_sigs.utils.sample_ids import to_patient_id, to_patient_index, safe_map_index
 from benchmark_sigs.utils.checks import nonempty
 
@@ -76,7 +76,7 @@ def integrate_data(
     cna_raw = read_cna_file(cna_path, cna_process=cna_process, rename=rename)
     cna_raw = safe_map_index(cna_raw, study, "CNA")
 
-    fusion_raw = load_fusions_raw(fusion_info_path) if fusion_info_path else None
+    fusion_raw = read_fusions_raw(fusion_info_path) if fusion_info_path else None
     if fusion_raw is not None:
         fusion_raw = safe_map_index(fusion_raw, study, "Fusions")
         if not nonempty(fusion_raw):
@@ -153,3 +153,4 @@ def integrate_data(
             fusion_df = pd.DataFrame(index=common)
 
     return mut_df, cna_df, fusion_df, clinical, clinical_df, rna_df
+
