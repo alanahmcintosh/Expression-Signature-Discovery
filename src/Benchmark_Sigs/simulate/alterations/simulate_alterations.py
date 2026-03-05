@@ -11,7 +11,7 @@ from benchmark_sigs.simulate.alterations.scaling import preprocess_X_weighted
 from benchmark_sigs.simulate.alterations.knn_sampler import sample_from_neighbors_ratioCNA
 
 
-def simulate_X_hybrid_ratioCNA(
+def simulate_X(
     mut,
     fusion,
     cna,
@@ -61,6 +61,9 @@ def simulate_X_hybrid_ratioCNA(
         sizes.iloc[-1] += n_samples - sizes.sum()  # fix rounding mismatch
 
     blocks = []
+Exports:
+- simulate_X_hybrid_ratioCNA: subtype-aware simulator for mut/fusion/cna/clinical
+- split_simulated_blocks_v2: split combined simulated matrix back into blocks
 
     for s, n in zip(sizes.index, sizes):
         n = int(n)
@@ -112,7 +115,7 @@ def simulate_X_hybrid_ratioCNA(
     return X_sim
 
 
-def split_simulated_blocks_v2(X_sim):
+def split_simulated_blocks(X_sim):
     """
     Splits a combined simulated matrix into separate dataframes for each omic block.
 
