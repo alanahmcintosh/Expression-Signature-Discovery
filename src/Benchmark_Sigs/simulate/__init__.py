@@ -1,5 +1,13 @@
-__all__ = [
-    "__version__",
-]
+# src/Benchmark_Sigs/simulate/__init__.py
+from .alterations.simulate_alterations import (
+    simulate_X_hybrid,
+    split_simulated_blocks,
+)
 
-__version__ = "0.1.0"
+from .rna.simulate_rna import simulate_rna_with_signatures
+
+__all__ = [
+    "simulate_X_hybrid",
+    "split_simulated_blocks",
+    "simulate_rna_with_signatures",
+]
