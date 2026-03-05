@@ -46,10 +46,12 @@ def create_supervised_signatures(
     gof,
     global_results=None,
     W_dict=None,
+    method="all",
     min_unique_x=2,
     min_std_x=1e-8,
     min_group_n=1,
 ):
+
     # ---- align samples once ----
     common = X.index.intersection(Y.index)
     X = X.loc[common]
@@ -66,6 +68,7 @@ def create_supervised_signatures(
 
     nunq = x.nunique(dropna=True)
     std = float(x.std())
+
     if nunq < min_unique_x or not (std > min_std_x):
         return {"SKIPPED": f"{gof}: predictor constant/low-var (n_unique={nunq}, std={std})"}
 
@@ -75,23 +78,59 @@ def create_supervised_signatures(
 
     signatures = {}
 
-    # ---- effect-style ML models: extract from precomputed weights ----
+    run_all = method == "all"
+
+    # ---- ML models from weights ----
     if W_dict is not None:
-        signatures.update(class_supervised_signatures(W_dict, gof))
+
+        if run_all or method == "Lasso":
+            signatures["Lasso"] = signature_from_weights_for_alt(
+                W_dict["Lasso"], gof, mode="nonzero"
+            )
+
+        if run_all or method == "ElasticNet":
+            signatures["ElasticNet"] = signature_from_weights_for_alt(
+                W_dict["ElasticNet"], gof, mode="nonzero"
+            )
+
+        if run_all or method == "Ridge":
+            signatures["Ridge"] = signature_from_weights_for_alt(
+                W_dict["Ridge"], gof, mode="elbow"
+            )
+
+        if run_all or method == "SVM":
+            signatures["SVM"] = signature_from_weights_for_alt(
+                W_dict["SVM"], gof, mode="elbow"
+            )
+
+        if run_all or method == "Random Forest":
+            signatures["Random Forest"] = signature_from_weights_for_alt(
+                W_dict["Random Forest"], gof, mode="elbow"
+            )
 
     # ---- Deconfounder ----
-    if global_results is not None:
+    if global_results is not None and (run_all or method == "Deconfounder"):
         signatures["Deconfounder"] = get_deconfounder_signature(gof, global_results)
 
     # ---- DESeq2 ----
-    try:
-        if (Y_sub < 0).any().any():
-            raise ValueError(f"{gof}: Y contains negative values; DESeq2 requires non-negative counts.")
+    if run_all or method == "DESeq2":
+        try:
 
-        X_design = pd.DataFrame({gof: x}, index=x.index)
-        signatures["DESeq2"] = get_deseq2_signature_binary(X_design, Y_sub, gof, min_group_n=min_group_n)
+            if (Y_sub < 0).any().any():
+                raise ValueError(
+                    f"{gof}: Y contains negative values; DESeq2 requires non-negative counts."
+                )
 
-    except Exception as e:
-        signatures["DESeq2_ERROR"] = repr(e)
+            X_design = pd.DataFrame({gof: x}, index=x.index)
+
+            signatures["DESeq2"] = get_deseq2_signature_binary(
+                X_design,
+                Y_sub,
+                gof,
+                min_group_n=min_group_n,
+            )
+
+        except Exception as e:
+            signatures["DESeq2_ERROR"] = repr(e)
 
     return signatures
