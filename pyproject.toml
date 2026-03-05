@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "expression-signature-discovery"
+version = "0.1.0"
+description = "Simulation and benchmarking framework for gene expression signature discovery"
+readme = "README.md"
+requires-python = "3.10.12"
+authors = [{ name = "Alanah McIntosh" }]
+license = { file = "LICENSE" }
+
+dependencies = [
+  "numpy",
+  "pandas",
+  "scipy",
+  "scikit-learn",
+  "joblib",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["Benchmark_Sigs*"]
