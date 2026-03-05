@@ -2,7 +2,7 @@
 from .clinical import (
     process_subtypes,
     select_known_clinicals,
-    encode_altertaions_clinical,
+    encode_alterations_clinical,
 )
 
 from .mutations import (
@@ -17,16 +17,16 @@ from .RNA import (
     select_genes_with_expr_filter,
 )
 
-from .fusions import read_fusions_file
+from .fusions import read_fusions_raw
 
 __all__ = [
     "process_subtypes",
     "select_known_clinicals",
-    "encode_altertaions_clinical",
+    "encode_alterations_clinical",
     "classify_variant",
     "maf_to_onehot",
     "integrate_data",
     "preprocess_rna_for_simulation",
     "select_genes_with_expr_filter",
-    "read_fusions_file",
+    "read_fusions_raw",
 ]
