@@ -76,3 +76,32 @@ def select_features_elbow(feature_names, weights, tol=1e-8):
 
     # Keep all features up to and including the knee
     return names_sorted[: knee_idx + 1].tolist()
+
+
+def signature_from_weights_for_alt(
+    W,
+    alt,
+    mode = "nonzero",   # "nonzero" or "elbow"
+    coef_tol = 1e-6,
+    elbow_tol = 1e-8,
+):
+    """
+    W: predictors x genes (weights or importances)
+    alt: predictor name (e.g., TP53_LOF, MYC_AMP)
+    mode:
+      - "nonzero": return genes with |weight| > coef_tol (good for Lasso/ElasticNet)
+      - "elbow": use select_features_elbow on |weights| (good for Ridge/RF/SVR)
+    """
+    if alt not in W.index:
+        return []
+
+    row = W.loc[alt].copy()
+    row = row.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    if mode == "nonzero":
+        return row.index[np.abs(row.values) > coef_tol].tolist()
+
+    if mode == "elbow":
+        return select_features_elbow(row.index, row.values, tol=elbow_tol)
+
+    raise ValueError("mode must be 'nonzero' or 'elbow'")
