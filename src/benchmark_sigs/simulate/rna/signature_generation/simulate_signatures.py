@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 from scipy import sparse
 
-from benchmark_sigs.simulate.rna.signature_generation.signature_params import (
+from benchmark_sigs.simulate.rna.signature_generation.signature_utils import (
     parse_alt,
     sample_size,
     sample_abs,
