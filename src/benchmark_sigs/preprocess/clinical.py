@@ -222,9 +222,12 @@ def encode_alterations_clinical(
 
     return Xs
 
+<<<<<<< HEAD:src/Benchmark_Sigs/preprocess/clinical.py
 
 
     return Xs
     print("Final Xs shape:", Xs.shape)
     
     return Xs
+=======
+>>>>>>> 7c6b8d7 (y):src/benchmark_sigs/preprocess/clinical.py

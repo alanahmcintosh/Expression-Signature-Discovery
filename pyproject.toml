@@ -7,16 +7,22 @@ name = "expression-signature-discovery"
 version = "0.1.0"
 description = "Simulation and benchmarking framework for gene expression signature discovery"
 readme = "README.md"
-requires-python = "3.10.12"
+requires-python = ">=3.10"
 authors = [{ name = "Alanah McIntosh" }]
 license = { file = "LICENSE" }
 
 dependencies = [
-  "numpy",
-  "pandas",
+  "numpy<2",
+  "pandas>=2.0",
   "scipy",
   "scikit-learn",
   "joblib",
+  "pydeseq2>=0.5.0",
+  "matplotlib",
+  "seaborn",
+  "pytest",
+  "ruff",
+  "ipykernel",
 ]
 
 [tool.setuptools]
