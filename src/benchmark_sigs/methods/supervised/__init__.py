@@ -14,7 +14,7 @@ from .models import (
 
 from .deseq2 import get_deseq2_signature_binary
 
-from .wrapper import (
+from .wrappers import (
     precompute_supervised_weights,
     create_supervised_signatures,
 )

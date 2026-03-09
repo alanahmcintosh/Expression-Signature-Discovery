@@ -16,15 +16,7 @@ from sklearn.model_selection import RepeatedKFold
 from sklearn.svm import LinearSVR
 from sklearn.ensemble import RandomForestRegressor
 
-from .utils import align_XY  
-
-__all__ = [
-    "fit_alt_to_expr_weights_lasso",
-    "fit_alt_to_expr_weights_elasticnet",
-    "fit_alt_to_expr_weights_ridge",
-    "fit_alt_to_expr_weights_svm",
-    "fit_alt_to_expr_importances_rf",
-]
+from benchmark_sigs.utils import align_XY  
 
 
 def fit_alt_to_expr_weights_lasso(

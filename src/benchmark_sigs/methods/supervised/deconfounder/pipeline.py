@@ -55,3 +55,11 @@ def compute_deconfounder(X, Y):
 
     print("Global precomputation completed.")
     return causal_signatures
+
+
+def get_deconfounder_signature(gof, global_results):
+    coefs_tr = global_results['Deconfounder']
+    if isinstance(gof, list):
+        gof = gof[0]
+    gene_signature = coefs_tr[[gof]].dropna()
+    return list(gene_signature.index)

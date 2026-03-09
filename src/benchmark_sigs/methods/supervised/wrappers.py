@@ -10,7 +10,7 @@ from .models import (
     fit_alt_to_expr_importances_rf,
 )
 from .deseq2 import get_deseq2_signature_binary
-from .signature_extraction import signature_from_weights_for_alt
+from .feature_selection import signature_from_weights_for_alt
 from .deconfounder import get_deconfounder_signature
 
 def class_supervised_signatures(W_dict, gof):
@@ -87,17 +87,18 @@ def create_supervised_signatures(
             signatures["Lasso"] = signature_from_weights_for_alt(
                 W_dict["Lasso"], gof, mode="nonzero"
             )
+            print('Lasso Success')
 
         if run_all or method == "ElasticNet":
             signatures["ElasticNet"] = signature_from_weights_for_alt(
                 W_dict["ElasticNet"], gof, mode="nonzero"
             )
-
+            print('EN Success')
         if run_all or method == "Ridge":
             signatures["Ridge"] = signature_from_weights_for_alt(
                 W_dict["Ridge"], gof, mode="elbow"
             )
-
+            print('Ridge Success')
         if run_all or method == "SVM":
             signatures["SVM"] = signature_from_weights_for_alt(
                 W_dict["SVM"], gof, mode="elbow"
@@ -107,11 +108,11 @@ def create_supervised_signatures(
             signatures["Random Forest"] = signature_from_weights_for_alt(
                 W_dict["Random Forest"], gof, mode="elbow"
             )
-
+            print('RF Success')
     # ---- Deconfounder ----
     if global_results is not None and (run_all or method == "Deconfounder"):
         signatures["Deconfounder"] = get_deconfounder_signature(gof, global_results)
-
+        print('DECF Success')
     # ---- DESeq2 ----
     if run_all or method == "DESeq2":
         try:
@@ -129,7 +130,7 @@ def create_supervised_signatures(
                 gof,
                 min_group_n=min_group_n,
             )
-
+            print('DSEQ2 Success')
         except Exception as e:
             signatures["DESeq2_ERROR"] = repr(e)
 
