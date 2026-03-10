@@ -7,36 +7,79 @@ from .models import (
     fit_alt_to_expr_weights_elasticnet,
     fit_alt_to_expr_weights_ridge,
     fit_alt_to_expr_weights_svm,
-    fit_alt_to_expr_importances_rf,
+    fit_alt_to_expr_weights_rf,
 )
-from .deseq2 import get_deseq2_signature_binary
+from .deseq2 import get_deseq2_signature_binary, precompute_deseq2_results
 from .feature_selection import signature_from_weights_for_alt
 from .deconfounder import get_deconfounder_signature
 
-def class_supervised_signatures(W_dict, gof):
+
+def class_supervised_signatures(W_dict, gof, stability_threshold=0.6):
     """
     Extract signatures for one alteration from precomputed weights/importances.
     """
     signatures = {}
-    signatures["Lasso"] = signature_from_weights_for_alt(W_dict["Lasso"], gof, mode="nonzero")
-    signatures["ElasticNet"] = signature_from_weights_for_alt(W_dict["ElasticNet"], gof, mode="nonzero")
-    signatures["Ridge"] = signature_from_weights_for_alt(W_dict["Ridge"], gof, mode="elbow")
-    signatures["SVM"] = signature_from_weights_for_alt(W_dict["SVM"], gof, mode="elbow")
-    signatures["Random Forest"] = signature_from_weights_for_alt(W_dict["Random Forest"], gof, mode="elbow")
+    signatures["Lasso"] = signature_from_weights_for_alt(
+        W_dict["Lasso"], gof, mode="nonzero"
+    )
+    signatures["ElasticNet"] = signature_from_weights_for_alt(
+        W_dict["ElasticNet"], gof, mode="nonzero"
+    )
+    signatures["Ridge"] = signature_from_weights_for_alt(
+        W_dict["Ridge"], gof, mode="stability", stability_threshold=stability_threshold
+    )
+    signatures["SVM"] = signature_from_weights_for_alt(
+        W_dict["SVM"], gof, mode="nonzero"
+    )
+    signatures["Random Forest"] = signature_from_weights_for_alt(
+        W_dict["Random Forest"], gof, mode="stability", stability_threshold=stability_threshold
+    )
     return signatures
 
 
-def precompute_supervised_weights(X_alt_df, Y_norm_df):
+def precompute_supervised_weights(
+    X_alt_df,
+    Y_norm_df,
+    ridge_n_bootstraps=20,
+    ridge_sample_fraction=0.5,
+    ridge_threshold_rule="mean",
+    ridge_threshold_z=1.0,
+    rf_n_bootstraps=20,
+    rf_sample_fraction=0.5,
+    rf_threshold_rule="mean",
+    rf_threshold_z=1.0,
+):
     """
     Fit effect models ONCE: expr ~ alterations.
-    Returns dict of method -> weights matrix (predictors x genes).
+
+    Returns
+    -------
+    dict
+        Method -> predictors x genes matrix
+
+        - Lasso / ElasticNet / SVM: coefficient matrices
+        - Ridge / Random Forest: stability-frequency matrices
     """
     W = {}
     W["Lasso"] = fit_alt_to_expr_weights_lasso(X_alt_df, Y_norm_df)
     W["ElasticNet"] = fit_alt_to_expr_weights_elasticnet(X_alt_df, Y_norm_df)
-    W["Ridge"] = fit_alt_to_expr_weights_ridge(X_alt_df, Y_norm_df)
+    W["Ridge"] = fit_alt_to_expr_weights_ridge(
+        X_alt_df,
+        Y_norm_df,
+        n_bootstraps=ridge_n_bootstraps,
+        sample_fraction=ridge_sample_fraction,
+        threshold_rule=ridge_threshold_rule,
+        threshold_z=ridge_threshold_z,
+    )
     W["SVM"] = fit_alt_to_expr_weights_svm(X_alt_df, Y_norm_df)
-    W["Random Forest"] = fit_alt_to_expr_importances_rf(X_alt_df, Y_norm_df)
+    W["Random Forest"] = fit_alt_to_expr_weights_rf(
+        X_alt_df,
+        Y_norm_df,
+        n_bootstraps=rf_n_bootstraps,
+        sample_fraction=rf_sample_fraction,
+        threshold_rule=rf_threshold_rule,
+        threshold_z=rf_threshold_z,
+    )
     return W
 
 
@@ -46,6 +89,7 @@ def create_supervised_signatures(
     gof,
     global_results=None,
     W_dict=None,
+    deseq2_sigs=None,
     method="all",
     min_unique_x=2,
     min_std_x=1e-8,
@@ -81,52 +125,47 @@ def create_supervised_signatures(
     run_all = method == "all"
 
     # ---- ML models from weights ----
+        # ---- ML models from weights ----
     if W_dict is not None:
 
         if run_all or method == "Lasso":
             signatures["Lasso"] = signature_from_weights_for_alt(
                 W_dict["Lasso"], gof, mode="nonzero"
             )
-            print('Lasso Success')
+            print("Lasso Success")
 
         if run_all or method == "ElasticNet":
             signatures["ElasticNet"] = signature_from_weights_for_alt(
                 W_dict["ElasticNet"], gof, mode="nonzero"
             )
-            print('EN Success')
+            print("EN Success")
+
         if run_all or method == "Ridge":
             signatures["Ridge"] = signature_from_weights_for_alt(
-                W_dict["Ridge"], gof, mode="elbow"
+                W_dict["Ridge"], gof, mode="stability", stability_threshold=0.6
             )
-            print('Ridge Success')
+            print("Ridge Success")
+
         if run_all or method == "SVM":
             signatures["SVM"] = signature_from_weights_for_alt(
-                W_dict["SVM"], gof, mode="elbow"
+                W_dict["SVM"], gof, mode="nonzero"
             )
+            print("SVM Success")
 
         if run_all or method == "Random Forest":
             signatures["Random Forest"] = signature_from_weights_for_alt(
-                W_dict["Random Forest"], gof, mode="elbow"
+                W_dict["Random Forest"], gof, mode="stability", stability_threshold=0.6
             )
-            print('RF Success')
+            print("RF Success")
+
     # ---- Deconfounder ----
     if global_results is not None and (run_all or method == "Deconfounder"):
         signatures["Deconfounder"] = get_deconfounder_signature(gof, global_results)
         print('DECF Success')
     # ---- DESeq2 ----
     if run_all or method == "DESeq2":
-        if (Y_sub < 0).any().any():
-            raise ValueError(
-                f"{gof}: Y contains negative values; DESeq2 requires non-negative counts."
-            )
-
-        res, deseq_sigs = get_deseq2_signature_binary(
-            X,
-            Y_sub
-        ) 
-
-        signatures["DESeq2"] = deseq_sigs
-        print('DESeq2 Success')
-
+        if deseq2_sigs is not None:
+            signatures["DESeq2"] = deseq2_sigs.get(gof, [])
+            print("DESeq2 Success")
 
     return signatures

@@ -80,3 +80,23 @@ def get_deseq2_signature_binary(
 
     return results, sig_genes
 
+def precompute_deseq2_results(
+    X_alt_df,
+    Y_count_df,
+    n_cpus=4,
+    alpha=0.05,
+):
+    """
+    Fit DESeq2 once across all alterations in X_alt_df.
+
+    Returns
+    -------
+    tuple
+        (results_dict, sig_genes_dict)
+    """
+    return get_deseq2_signature_binary(
+        X_alt_df,
+        Y_count_df,
+        n_cpus=n_cpus,
+        alpha=alpha,
+    )

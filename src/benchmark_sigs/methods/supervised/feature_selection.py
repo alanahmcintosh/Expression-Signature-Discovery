@@ -5,92 +5,121 @@ from __future__ import annotations
 import numpy as np
 
 
-def select_features_elbow(feature_names, weights, tol=1e-8):
+def select_features_by_stability(feature_names, stability_scores, threshold=0.6, tol=1e-12):
     """
-    Elbow-based feature selector.
-
-    - Takes absolute weights/importances.
-    - Finds the 'knee' of the sorted curve (rank vs |weight|).
-    - Returns all features up to the knee index.
+    Select features whose stability frequency is >= threshold.
 
     Parameters
     ----------
     feature_names : sequence of str
-        Feature names aligned to `weights`.
-    weights : array-like
-        Weights/importances aligned to `feature_names`.
+        Feature names aligned to `stability_scores`.
+    stability_scores : array-like
+        Selection frequencies in [0, 1], aligned to `feature_names`.
+    threshold : float
+        Minimum stability frequency required to keep a feature.
     tol : float
-        Threshold below which weights are treated as zero.
+        Small numerical tolerance.
 
     Returns
     -------
     list[str]
-        Selected feature names (up to the knee), sorted by descending |weight|.
+        Selected feature names, sorted by descending stability score.
     """
-    weights = np.asarray(weights).ravel()
-    abs_w = np.abs(weights)
-
+    scores = np.asarray(stability_scores, dtype=float).ravel()
     feature_names = np.asarray(feature_names)
-    if feature_names.shape[0] != abs_w.shape[0]:
+
+    if feature_names.shape[0] != scores.shape[0]:
         raise ValueError(
-            f"feature_names and weights must have the same length "
-            f"({feature_names.shape[0]} vs {abs_w.shape[0]})."
+            f"feature_names and stability_scores must have the same length "
+            f"({feature_names.shape[0]} vs {scores.shape[0]})."
         )
 
-    # Only consider clearly non-zero weights
-    mask = abs_w > tol
-    if mask.sum() == 0:
+    scores = np.nan_to_num(scores, nan=0.0, posinf=0.0, neginf=0.0)
+
+    keep = scores >= (threshold - tol)
+    if keep.sum() == 0:
         return []
 
-    abs_w_nz = abs_w[mask]
-    names_nz = feature_names[mask]
+    kept_names = feature_names[keep]
+    kept_scores = scores[keep]
 
-    n = len(abs_w_nz)
-    if n <= 1:
-        return names_nz.tolist()
+    order = np.argsort(kept_scores)[::-1]
+    return kept_names[order].tolist()
 
-    # Sort descending by |weight|
-    order = np.argsort(abs_w_nz)[::-1]
-    w_sorted = abs_w_nz[order]
-    names_sorted = names_nz[order]
 
-    # Coordinates (rank, value)
-    x = np.arange(n, dtype=float)
-    y = w_sorted.astype(float)
 
-    # Line from first to last point
-    x0, y0 = 0.0, y[0]
-    x1, y1 = float(n - 1), y[-1]
-    dx = x1 - x0
-    dy = y1 - y0
-    denom = np.sqrt(dx**2 + dy**2)
+def score_threshold_mask(scores, rule="mean", z=1.0, tol=1e-12):
+    """
+    Convert a dense score vector into a boolean selection mask using
+    a threshold rule.
+    
+    Parameters
+    ----------
+    scores : array-like
+        Non-negative scores for one gene across predictors.
+    rule : str
+        Thresholding rule:
+        - 'mean'      : keep scores > mean(scores)
+        - 'median'    : keep scores > median(scores)
+        - 'mean+sd'   : keep scores > mean(scores) + z * sd(scores)
+    z : float
+        Multiplier used only for rule='mean+sd'.
+    tol : float
+        Numerical tolerance.
 
-    if denom == 0:
-        # Flat line — all weights equal: keep all non-zero
-        return names_sorted.tolist()
+    Returns
+    -------
+    np.ndarray
+        Boolean mask of selected predictors.
+    """
+    scores = np.asarray(scores, dtype=float).ravel()
+    scores = np.nan_to_num(scores, nan=0.0, posinf=0.0, neginf=0.0)
 
-    # Per-point distance to the straight line
-    # |dy*x_i - dx*y_i + x1*y0 - y1*x0| / sqrt(dx^2+dy^2)
-    dist = np.abs(dy * x - dx * y + x1 * y0 - y1 * x0) / denom
-    knee_idx = int(np.argmax(dist))
+    if scores.size == 0:
+        return np.zeros(0, dtype=bool)
 
-    # Keep all features up to and including the knee
-    return names_sorted[: knee_idx + 1].tolist()
+    if rule == "mean":
+        thr = float(np.mean(scores))
+    elif rule == "median":
+        thr = float(np.median(scores))
+    elif rule == "mean+sd":
+        thr = float(np.mean(scores) + z * np.std(scores))
+    else:
+        raise ValueError("rule must be one of: 'mean', 'median', 'mean+sd'")
+
+    return scores > (thr + tol)
+
 
 
 def signature_from_weights_for_alt(
     W,
     alt,
-    mode = "nonzero",   # "nonzero" or "elbow"
-    coef_tol = 1e-6,
-    elbow_tol = 1e-8,
+    mode="nonzero",   # "nonzero" or "stability"
+    coef_tol=1e-6,
+    stability_threshold=0.6,
 ):
     """
-    W: predictors x genes (weights or importances)
-    alt: predictor name (e.g., TP53_LOF, MYC_AMP)
-    mode:
-      - "nonzero": return genes with |weight| > coef_tol (good for Lasso/ElasticNet)
-      - "elbow": use select_features_elbow on |weights| (good for Ridge/RF/SVR)
+    Extract selected genes for one alteration from a predictors x genes matrix.
+
+    Parameters
+    ----------
+    W : pd.DataFrame
+        predictors x genes matrix.
+        - For mode='nonzero': coefficient / importance matrix
+        - For mode='stability': stability-frequency matrix in [0, 1]
+    alt : str
+        Predictor / alteration name.
+    mode : str
+        Selection mode: 'nonzero' or 'stability'
+    coef_tol : float
+        Absolute coefficient threshold for 'nonzero' mode.
+    stability_threshold : float
+        Inclusion threshold for 'stability' mode.
+
+    Returns
+    -------
+    list[str]
+        Selected genes.
     """
     if alt not in W.index:
         return []
@@ -99,9 +128,14 @@ def signature_from_weights_for_alt(
     row = row.replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
     if mode == "nonzero":
-        return row.index[np.abs(row.values) > coef_tol].tolist()
+        vals = np.asarray(row.values, dtype=float)
+        return row.index[np.abs(vals) > coef_tol].tolist()
 
-    if mode == "elbow":
-        return select_features_elbow(row.index, row.values, tol=elbow_tol)
+    if mode == "stability":
+        return select_features_by_stability(
+            feature_names=row.index,
+            stability_scores=row.values,
+            threshold=stability_threshold,
+        )
 
-    raise ValueError("mode must be 'nonzero' or 'elbow'")
+    raise ValueError("mode must be 'nonzero' or 'stability'")

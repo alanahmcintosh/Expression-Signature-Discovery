@@ -7,9 +7,6 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-# =============================================================================
-# 10. PRE-RNA SIMULATION PROCESSING
-# =============================================================================
 
 def preprocess_rna_for_simulation(rna_df, strategy="auto", user_scale=None, verbose=True):
     """

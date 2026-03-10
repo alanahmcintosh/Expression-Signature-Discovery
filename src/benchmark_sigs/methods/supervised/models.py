@@ -18,6 +18,8 @@ from sklearn.ensemble import RandomForestRegressor
 
 from benchmark_sigs.utils import align_XY  
 
+from benchmark_sigs.methods.supervised.feature_selection import score_threshold_mask
+
 
 def fit_alt_to_expr_weights_lasso(
     X_alt,
@@ -120,15 +122,62 @@ def fit_alt_to_expr_weights_elasticnet(
     return W
 
 
-def fit_alt_to_expr_weights_ridge(X_alt, Y_expr, alphas=np.logspace(-3, 3, 13)):
+def fit_alt_to_expr_weights_ridge(
+    X_alt,
+    Y_expr,
+    alphas=np.logspace(-3, 3, 13),
+    n_bootstraps=20,
+    sample_fraction=0.5,
+    random_state=44,
+    threshold_rule="mean",
+    threshold_z=1.0,
+):
     """
-    RidgeCV multi-output regression: Y_expr ~ X_alt (fits ALL genes at once, fast).
-    Returns dense weights: predictors x genes.
+    Stability selection for Ridge.
+
+    For each resample:
+      1. fit RidgeCV on all genes jointly
+      2. for each gene, compute abs(coef)
+      3. select predictors whose abs(coef) passes the threshold rule
+      4. accumulate selection counts
+
+    Returns
+    -------
+    pd.DataFrame
+        predictors x genes matrix of selection frequencies in [0, 1].
     """
     X, Y = align_XY(X_alt, Y_expr)
-    rcv = RidgeCV(alphas=alphas)
-    rcv.fit(X.values, Y.values)
-    return pd.DataFrame(rcv.coef_.T, index=X.columns, columns=Y.columns, dtype=float)
+
+    rng = np.random.default_rng(random_state)
+    n, p = X.shape
+    g = Y.shape[1]
+
+    sub_n = max(2, int(np.floor(sample_fraction * n)))
+    counts = np.zeros((p, g), dtype=float)
+
+    Xv = X.values
+    Yv = Y.values
+
+    for b in range(n_bootstraps):
+        idx = rng.choice(n, size=sub_n, replace=False)
+        Xb = Xv[idx]
+        Yb = Yv[idx]
+
+        model = RidgeCV(alphas=alphas)
+        model.fit(Xb, Yb)
+
+        coef_abs = np.abs(model.coef_)   # shape: (n_genes, n_features)
+
+        for j in range(g):
+            mask = score_threshold_mask(
+                coef_abs[j, :],
+                rule=threshold_rule,
+                z=threshold_z,
+            )
+            counts[mask, j] += 1.0
+
+    freqs = counts / float(n_bootstraps)
+    return pd.DataFrame(freqs, index=X.columns, columns=Y.columns, dtype=float)
 
 
 def fit_alt_to_expr_weights_svm(
@@ -159,30 +208,65 @@ def fit_alt_to_expr_weights_svm(
     return W
 
 
-def fit_alt_to_expr_importances_rf(
+def fit_alt_to_expr_weights_rf(
     X_alt,
     Y_expr,
-    n_estimators=200,
-    max_depth=12,
+    n_estimators=50,
+    max_depth=8,
     random_state=44,
-    n_jobs=8,
+    n_jobs=1,
+    n_bootstraps=20,
+    sample_fraction=0.5,
+    threshold_rule="mean",
+    threshold_z=1.0,
 ):
     """
-    RF regressor per gene: expr_gene ~ X_alt
-    Returns importances: predictors x genes (dense).
+    Stability selection for Random Forest.
+
+    For each resample and each gene:
+      1. fit RF regressor
+      2. get feature_importances_
+      3. select predictors whose importance passes the threshold rule
+      4. accumulate selection counts
+
+    Returns
+    -------
+    pd.DataFrame
+        predictors x genes matrix of selection frequencies in [0, 1].
     """
     X, Y = align_XY(X_alt, Y_expr)
-    W = pd.DataFrame(index=X.columns, columns=Y.columns, dtype=float)
 
-    for gene in Y.columns:
-        y = Y[gene].values
-        rf = RandomForestRegressor(
-            n_estimators=n_estimators,
-            max_depth=max_depth,
-            random_state=random_state,
-            n_jobs=n_jobs,
-        )
-        rf.fit(X.values, y)
-        W[gene] = rf.feature_importances_
+    rng = np.random.default_rng(random_state)
+    n, p = X.shape
+    g = Y.shape[1]
 
-    return W
+    sub_n = max(2, int(np.floor(sample_fraction * n)))
+    counts = np.zeros((p, g), dtype=float)
+
+    for b in range(n_bootstraps):
+        idx = rng.choice(n, size=sub_n, replace=False)
+        Xb = X.iloc[idx]
+        Yb = Y.iloc[idx]
+
+        for j, gene in enumerate(Y.columns):
+            yb = Yb[gene].values
+
+            rf = RandomForestRegressor(
+                n_estimators=n_estimators,
+                max_depth=max_depth,
+                random_state=random_state + b,
+                n_jobs=n_jobs,
+            )
+            rf.fit(Xb.values, yb)
+
+            scores = rf.feature_importances_
+
+            mask = score_threshold_mask(
+                scores,
+                rule=threshold_rule,
+                z=threshold_z,
+            )
+            counts[mask, j] += 1.0
+
+    freqs = counts / float(n_bootstraps)
+    return pd.DataFrame(freqs, index=X.columns, columns=Y.columns, dtype=float)
