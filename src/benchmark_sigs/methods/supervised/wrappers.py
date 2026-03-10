@@ -115,23 +115,18 @@ def create_supervised_signatures(
         print('DECF Success')
     # ---- DESeq2 ----
     if run_all or method == "DESeq2":
-        try:
-
-            if (Y_sub < 0).any().any():
-                raise ValueError(
-                    f"{gof}: Y contains negative values; DESeq2 requires non-negative counts."
-                )
-
-            X_design = pd.DataFrame({gof: x}, index=x.index)
-
-            signatures["DESeq2"] = get_deseq2_signature_binary(
-                X_design,
-                Y_sub,
-                gof,
-                min_group_n=min_group_n,
+        if (Y_sub < 0).any().any():
+            raise ValueError(
+                f"{gof}: Y contains negative values; DESeq2 requires non-negative counts."
             )
-            print('DSEQ2 Success')
-        except Exception as e:
-            signatures["DESeq2_ERROR"] = repr(e)
+
+        res, deseq_sigs = get_deseq2_signature_binary(
+            X,
+            Y_sub
+        ) 
+
+        signatures["DESeq2"] = deseq_sigs
+        print('DESeq2 Success')
+
 
     return signatures

@@ -10,7 +10,6 @@ from pydeseq2.ds import DeseqStats
 def get_deseq2_signature_binary(
     X,
     Y,
-    gof,
     n_cpus=4,
     alpha=0.05,
     min_group_n=1,
@@ -43,43 +42,41 @@ def get_deseq2_signature_binary(
     # raw counts
     counts = Y.astype(int)
 
-    # predictor
-    x = pd.to_numeric(X[gof], errors="coerce").dropna()
-    if x.shape[0] < 2 * min_group_n:
-        return []
+    metadata = X.copy()
 
-    counts = counts.loc[x.index]
-    x = x.astype(int)
-
-    # group size guard
-    vc = x.value_counts()
-    if (0 not in vc) or (1 not in vc) or vc[0] < min_group_n or vc[1] < min_group_n:
-        return []
-
-    # metadata table
-    metadata = pd.DataFrame(index=counts.index)
-    metadata["condition"] = x.astype(str)
-
-    # Make it categorical and set reference level explicitly
-    metadata["condition"] = pd.Categorical(metadata["condition"], categories=["0", "1"])
+    for col in metadata.columns:
+        metadata[col] = pd.Categorical(metadata[col].astype(str), categories=['0', '1'])
 
     dds = DeseqDataSet(
         counts=counts,
         metadata=metadata,
-        design_factors="condition",
-        ref_level=["condition", "0"],
+        design_factors=list(metadata.columns),
+        ref_level=[metadata.columns[0], "0"],
         refit_cooks=False,
         n_cpus=n_cpus,
     )
     dds.deseq2()
 
-    stat_res = DeseqStats(
-        dds,
-        contrast=["condition", "1", "0"],
-        alpha=alpha,
-    )
-    stat_res.summary()
+    results = {}
+    sig_genes = {}
 
-    res = stat_res.results_df
-    sig = res[res["padj"] < alpha]
-    return list(sig.index)
+    for gene in metadata.columns:
+ 
+        deseq_gene = gene.replace("_", "-")
+
+        stat_res = DeseqStats(
+            dds,
+            contrast=[deseq_gene, "1", "0"],
+            alpha=alpha,
+            quiet=True,
+        )
+        stat_res.summary()
+
+        res = stat_res.results_df.copy()
+        sig = res.loc[res["padj"].notna() & (res["padj"] < alpha)]
+
+        results[gene] = res
+        sig_genes[gene] = sig.index.tolist()
+
+    return results, sig_genes
+
