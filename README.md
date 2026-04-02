@@ -143,6 +143,7 @@ DATASET/
 | File | Description |
 |-----|-------------|
 | `alterations_*.csv` | Simulated alteration matrix |
+| `alt_real_*.csv` | Real alteration matrix used to parameterize simulation |
 | `rna_simulated_*.csv` | Simulated RNA expression |
 | `rna_real_*.csv` | Real RNA expression used to parameterize simulation |
 | `true_signatures_*.json` | Ground truth gene signatures |
