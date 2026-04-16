@@ -17,6 +17,7 @@ dependencies = [
   "scipy",
   "scikit-learn",
   "joblib",
+  "rpy2",
   "pydeseq2==0.4.12",
   "matplotlib",
   "seaborn",
@@ -26,8 +27,8 @@ dependencies = [
 ]
 
 [tool.setuptools]
-package-dir = {"" = "src"}
+package-dir = {"" = "source"}
 
 [tool.setuptools.packages.find]
-where = ["src"]
-include = ["Benchmark_Sigs*"]
+where = ["source"]
+include = ["benchmark_sigs*"]
