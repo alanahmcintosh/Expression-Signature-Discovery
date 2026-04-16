@@ -118,6 +118,8 @@ def create_supervised_signatures(
     global_results=None,
     W_dict=None,
     deseq2_sigs=None,
+    limma_sigs=None,
+    edger_sigs = None,
     method="all",
     min_unique_x=1,
     min_std_x=1e-8,
@@ -190,10 +192,33 @@ def create_supervised_signatures(
     if global_results is not None and (run_all or method == "Deconfounder"):
         signatures["Deconfounder"] = get_deconfounder_signature(gof, global_results)
         print('DECF Success')
+
     # ---- DESeq2 ----
     if run_all or method == "DESeq2":
         if deseq2_sigs is not None:
             signatures["DESeq2"] = deseq2_sigs.get(gof, [])
             print("DESeq2 Success")
+
+     # ---- limma ----
+    if run_all or method == "limma":
+        if limma_sigs is not None:
+            signatures["limma"] = limma_sigs.get(gof, [])
+            print("limma Success")
+
+    if run_all or method == "LimmaMulti":
+        if limma_sigs is not None:
+            signatures["LimmaMulti"] = limma_sigs.get(gof, [])
+            print("LimmaMulti Success")
+
+    # ---- edgeR ----
+    if run_all or method == "edgeR":
+        if edger_sigs is not None:
+            signatures["edgeR"] = edger_sigs.get(gof, [])
+            print("edgeR Success")
+    
+    if run_all or method == "edgeRMulti":
+        if edger_sigs is not None:
+            signatures["edgeRMulti"] = edger_sigs.get(gof, [])
+            print("edgeRMulti Success")
 
     return signatures
